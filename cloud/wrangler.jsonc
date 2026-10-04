@@ -1,0 +1,42 @@
+{
+  "name": "doin-sync",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "compatibility_flags": [
+    "global_fetch_strictly_public"
+  ],
+  "routes": [
+    {
+      "pattern": "sync.doin.sh",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "ORIGIN": "https://sync.doin.sh",
+    "EMAIL_ENABLED": "true",
+    "EMAIL_FROM": "login@doin.sh",
+    "STRIPE_PRICE_ID": "price_1UMYNZJ8ruTe6uCONYcpFNkf",
+    "STRIPE_MONTHLY_PRICE_ID": "price_1UMak0J8ruTe6uCOcJfZsvU9",
+    "STRIPE_YEARLY_PRICE_ID": "price_1UMaoEJ8ruTe6uCOlU735EJ8",
+    "STRIPE_TEAM_PRICE_ID": "price_1UMca5J8ruTe6uCO8v5cTsqo",
+    "LICENSE_PUBLIC_KEY": "{\"crv\":\"Ed25519\",\"x\":\"eZh-xhJjz5Kats7peHeesOgFVMOLbxrFp1kQXGhLDgg\",\"kty\":\"OKP\"}",
+    "LICENSE_KEY_ID": "doin-commercial-2026-10"
+  },
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "allowed_sender_addresses": [
+        "login@doin.sh"
+      ]
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "doin-sync",
+      "database_id": "b09216c4-d06a-4302-9a2b-e7c3a4423132",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

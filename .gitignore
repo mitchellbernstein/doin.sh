@@ -1,0 +1,12 @@
+.zig-cache/
+zig-out/
+artifacts/
+.DS_Store
+*.tmp
+package/
+dist/
+__pycache__/
+.wrangler/
+
+cloud/.wrangler.personal.jsonc
+cloud/.wrangler.commercial.jsonc

@@ -1,0 +1,60 @@
+doin.sh Personal Use License 1.0
+
+Copyright (c) 2026 Studio Yeehaw LLC
+
+1. Scope
+
+This license covers the doin.sh source code, binaries, and documentation owned
+by Studio Yeehaw LLC and distributed with this license (the "Software").
+Third-party software, libraries, models, and other materials remain governed
+by their own licenses. This license does not change permissions previously
+granted for earlier versions, including the MIT-licensed v0.1.0 release.
+
+2. Personal use permission
+
+Subject to these terms, you may inspect, download, run, copy, and modify the
+Software solely for your own personal, noncommercial use. You may keep backups
+and publish source forks and modifications free of charge, provided recipients
+receive this license and may use them only under these same terms. Include this
+license and the copyright notice in every copy or substantial portion, and
+identify modifications without implying endorsement by Studio Yeehaw LLC.
+
+"Personal, noncommercial use" means use by an individual for private purposes,
+without business, professional, organizational, or revenue-generating use.
+This permission includes self-hosting for those personal purposes.
+
+3. Restrictions
+
+You may not sell, license for a fee, rent, commercially distribute, or otherwise
+monetize the Software or modified versions. You may not incorporate the Software
+into a commercial product, provide it as a paid or advertising-supported service,
+or use it for business, professional, or organizational purposes. These
+restrictions apply to source and binary copies and to modified versions.
+Commercial rights require a separate written agreement with Studio Yeehaw LLC.
+Companies, organizations, and teams require a paid commercial license for
+self-hosting or use of team features. A commercial license may permit
+self-hosting within its agreed scope; it does not grant resale or commercial
+redistribution rights unless the agreement expressly grants them.
+All rights not expressly granted are reserved. No trademark rights are granted.
+
+4. Your content and hosted services
+
+This license does not claim ownership of your task files or other user-created
+content. Optional hosted services offered by Studio Yeehaw LLC are governed by
+their separate service terms. Paying for an official service does not grant
+commercial redistribution rights to the Software.
+
+5. Termination
+
+Your permissions under this license terminate if you breach its terms. Nothing
+in this license limits rights that applicable law grants independently of it.
+
+6. Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE, TO THE EXTENT PERMITTED BY APPLICABLE LAW.

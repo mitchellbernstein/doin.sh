@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+voice_path=$0
+voice_links=0
+while [ -L "$voice_path" ]; do
+    voice_links=$((voice_links + 1))
+    [ "$voice_links" -le 40 ] || { echo 'Voice launcher has too many symlinks.' >&2; exit 2; }
+    voice_root=$(CDPATH= cd -- "$(dirname -- "$voice_path")" && pwd)
+    voice_path=$(readlink "$voice_path")
+    case "$voice_path" in
+        /*) ;;
+        *) voice_path=$voice_root/$voice_path ;;
+    esac
+done
+voice_root=$(CDPATH= cd -- "$(dirname -- "$voice_path")" && pwd)
+exec "$voice_root/.venv/bin/python" "$voice_root/capture.py" "$@"

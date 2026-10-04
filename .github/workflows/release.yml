@@ -1,0 +1,97 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Verify native behavior
+        run: |
+          zig build -j1 -Doptimize=ReleaseSmall
+          python3 tests/e2e.py
+          python3 tests/focus_e2e.py
+          python3 tests/focus_ai_e2e.py
+          python3 tests/providers_e2e.py
+          python3 tests/uninstall_e2e.py
+          python3 tests/update_e2e.py
+          python3 tests/package_version_e2e.py
+          python3 tests/auth_e2e.py
+          python3 tests/tui_e2e.py
+          python3 tests/reflow_e2e.py
+          python3 tests/productivity_e2e.py
+          python3 tests/reminders_e2e.py
+          python3 tests/sync_client_e2e.py
+          python3 tests/mcp_e2e.py
+          python3 tests/mcp_client_e2e.py
+          python3 tests/mcp_cloud_client_e2e.py
+          python3 tests/folders_e2e.py
+          python3 tests/properties_e2e.py
+          python3 tests/agent_guidance_e2e.py
+          python3 tests/commands_pty_e2e.py
+          python3 tests/ai_tools_e2e.py
+          python3 tests/streaming_e2e.py
+          python3 tests/auto_sync_e2e.py
+          python3 tests/library_sync_e2e.py
+          python3 tests/team_client_e2e.py
+          python3 tests/mcp_oauth_cli_e2e.py
+          python3 tests/reminder_interrupt_e2e.py
+      - name: Package supported platforms
+        run: |
+          sh scripts/package.sh
+          python3 tests/install_e2e.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: dist/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-evidence
+          path: artifacts/
+  publish:
+    needs: [package, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: dist
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Verify Windows execution before publication
+        run: |
+          zig build -j1 -Doptimize=ReleaseSmall
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force artifacts/windows-e2e | Out-Null
+          zig build-exe --dep platform '-Mroot=tests/platform_driver.zig' '-Mplatform=src/platform.zig' -lc -ladvapi32 -lshell32 '-femit-bin=artifacts/windows-e2e/platform-driver.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/windows_e2e.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File tests/windows_install_e2e.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-release-evidence
+          path: artifacts/windows-e2e/

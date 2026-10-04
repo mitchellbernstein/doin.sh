@@ -1,0 +1,11 @@
+# doinMORE and doinWITH
+
+New subscriptions: USD $4.99/month or $49.99/year. Manual local use, user-supplied AI, local dictation and local MCP are free. doinMORE pays for managed sync and hosted integrations. doinWITH is USD $99/user/year, annual only. Model usage remains supplied by the user; these prices do not include hosted inference. Managed sync uses the same account across terminal, iOS and macOS apps; native app availability and App Store purchasing are separate delivery work. Billing is test mode until production activation. Existing legacy subscriptions retain their price.
+
+One persisted checkout claim per account prevents multiple payable sessions. Switching periods expires the preceding open session before replacement; completed sessions require account management. Separate period claims would permit duplicate subscriptions; editing subscriptions would introduce unrequested repricing/proration. Native offers must match the server-allowed prices before opening checkout.
+
+Failure scenarios: lost create responses, repeated selections, expiry outages, completion during switching, crash after expiration, invalid offers, mismatched amounts and legacy entitlement. Worker/D1 and native PTY evidence lives in cloud/artifacts and artifacts/tui-e2e; actual Worker/native integration in artifacts/sync-client.
+
+Primary references checked for this change: [Stripe price management](https://docs.stripe.com/products-prices/manage-prices), [Checkout creation](https://docs.stripe.com/api/checkout/sessions/create), [Checkout expiration](https://docs.stripe.com/api/checkout/sessions/expire), [D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/), [Wrangler deploy](https://developers.cloudflare.com/workers/wrangler/commands/#deploy). Price amounts and intervals are immutable; additional recurring prices are required.
+
+Delivery verified: Worker version `059b9d39-a340-4beb-81a8-ac5174315e70` exposes both offers in test mode. Release v0.2.3 is public and installed through its checksum-verifying public installer. Seventeen native PTY, eight Worker/CAS, five client integration and five installer groups passed; Linux CI and release automation passed. No payment submitted. Screenshot and deployed-plan/install receipt: `artifacts/pricing/`.

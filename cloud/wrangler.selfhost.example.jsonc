@@ -1,0 +1,22 @@
+{
+  "name": "doin-personal",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "workers_dev": true,
+  "vars": {
+    "ORIGIN": "https://REPLACE_WITH_YOUR_WORKER_HOST",
+    "SELF_HOST_MODE": "personal",
+    "SELF_HOST_OWNER_EMAIL": "REPLACE_WITH_YOUR_EMAIL",
+    "EMAIL_ENABLED": "true",
+    "EMAIL_FROM": "REPLACE_WITH_VERIFIED_SENDER"
+  },
+  "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["REPLACE_WITH_VERIFIED_SENDER"] }],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "REPLACE_WITH_YOUR_NAMESPACE_ID" }],
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "doin-personal",
+    "database_id": "REPLACE_WITH_YOUR_DATABASE_ID",
+    "migrations_dir": "migrations"
+  }]
+}

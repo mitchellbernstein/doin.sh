@@ -1,0 +1,25 @@
+# ChatGPT authentication
+
+Before implementation, the failure cases are: denied consent; forged or duplicated callbacks; wrong state, nonce, client, account, issuer, audience or signature; expired token; listener port conflicts and hangs; missing plan scope; missing dependencies; malformed or oversized HTTP/JWT/JSON; failed refresh or rotating refresh token; interrupted writes; credentials exposed through command arguments, logs, permissions or temporary files; concurrent writers; and accidental reuse of Codex credentials.
+
+The implementation uses the direct public-client OSS flow documented at https://developers.openai.com/siwc/token-sharing-open-source/sign-in and OpenAI discovery at https://auth.openai.com/.well-known/openid-configuration. It needs curl and openssl on PATH. It never reads Codex credentials. The browser uses a loopback callback on 127.0.0.1. Authentication is bounded by a five-minute callback timeout. Credentials are owner-only and atomically replaced. One ChatGPT registration/account is active per config directory; use separate config directories for separate accounts. The host ID and account/client mapping survive logout. Logout attempts remote refresh-token revocation, removes local tokens, and reports when revocation was not confirmed.
+
+Signature verification accepts only RS256 and OpenAI's fetched RSA JWKS. Returning sign-in uses an email hint rather than printing an ID token in its fallback URL. Token claims are validated before credentials are stored. Invalid or expired refresh credentials require a new login. Requests use stdin, so tokens are not exposed in process arguments. OAuth endpoints and API resource are fixed to OpenAI.
+
+Session behavior follows https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions . Refreshes are serialized by an advisory file lock.
+
+## Black-box authentication scenarios (defined before the harness)
+
+The fixture drives the real executable, browser handoff, loopback socket, curl subprocess boundary, and real OpenSSL signature verifier. It must cover fragmented HTTP request lines; wrong state followed by a valid callback; a signed ID token with matching nonce/client/account; revoked or malformed identity; absent plan scope; a rotated refresh token with serialized persistence; client/account mismatches that preserve the prior credentials; owner-only files; tokens absent from process arguments; and logout revocation with retained host/client mapping. Provider HTTP is replaced by a deterministic local subprocess fixture; no real account or provider requests are allowed. Generated RSA fixture keys are disposable and never copied into artifacts. The reproducible artifact records binary hash, cases, redacted subprocess arguments, and sanitized terminal output.
+
+Reproduce the fixture with `python3 tests/auth_e2e.py --bin zig-out/bin/doin`. Evidence is written to `artifacts/auth-e2e/results.json` and `transcript.md`; use `--artifacts` to choose another folder. RSA keys and credentials exist only inside a disposable temporary directory. The fixture requires Python 3 and a real OpenSSL executable and never launches a real browser. It also checks that a concurrent logout is rejected while login owns the authentication lock.
+
+## Recovery behavior scenarios
+
+Before the recovery change, identified failure paths are a selected ChatGPT provider with no saved login, missing curl/OpenSSL, a failed refresh exchange, refresh returning reduced plan scopes, browser consent denial, and successful standalone login while the CLI still has manual mode selected. The black-box fixture must prove a missing login gives a recovery action, failed or reduced-scope refresh preserves credentials and Markdown, and denied consent preserves the active account. A successful login should explain that provider/model selection remains in the model command.
+
+The recovery fixture additionally exercises real interactive onboarding: a model-catalog outage still saves the selected storage and manually entered ChatGPT model; denied consent returns to the provider menu and lets the user finish with manual mode. Missing saved credentials explain `login`; failed refresh explains retry/sign-in without replacing the account or document. These tests verify the executable against provider fixtures, not live ChatGPT browser consent.
+
+Model catalog regressions exercise malicious CSI cursor-clearing and OSC title sequences from both ChatGPT and the local model catalog. The actual executable strips these sequences before printing names. Preserved before-fix artifacts record the real failing behavior; the final auth and PTY reports verify the correction.
+
+The current distribution uses a personal-use source-available license. OpenAI describes the documented flow for open-source and locally hosted apps. Eligibility for this license has not been confirmed; fixture checks do not prove account consent or plan entitlement.

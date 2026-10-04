@@ -1,0 +1,44 @@
+# Optional reminders
+
+Reminders stay off until you enable them. Adding a reminder does not install a background job or send a notification.
+
+```sh
+doin remind 2 in 15m
+doin remind 2 tomorrow 09:00
+doin remind 2 '2027-06-01 14:30'
+doin remind list
+doin remind enable --manual
+doin remind check
+doin remind 2 off
+```
+
+The terminal also accepts `/remind` commands. Times use your local timezone. Invalid dates and daylight-saving times that occur twice or never occur are rejected. For those cases, provide an explicit offset, for example `2027-11-07T01:30:00-05:00`. Relative times accept `m`, `h`, and `d`.
+
+On macOS, `doin remind enable` explicitly installs a per-user LaunchAgent. It checks every minute while logged in; it is not a continuous process. `doin remind disable` stops checks. Notifications use macOS notification preferences; delivery is subject to system notification settings. On Linux, `enable` registers a systemd user timer; desktop notifications require `notify-send` and a desktop session. Windows uses a least-privilege interactive Task Scheduler task and a passive taskbar notification through Windows Forms. It does not promise WinRT notification-center history or click actions. Every platform also supports `enable --manual` and `check` without a scheduled job.
+
+Reminder IDs and due timestamps live in validated trailing Markdown comments. They travel with your Markdown, including through sync. Delivery history and the enabled setting remain private to each device and storage location in your configuration folder. Changing task numbers or titles keeps the reminder attached to the same ID. Copying an ID onto multiple tasks blocks checks until the duplicate is removed.
+
+Completed or deleted tasks cancel pending reminders. Reopening a canceled task requires an explicit new reminder. Delivered reminders do not repeat. Checks claim a reminder before invoking the notification tool: interrupted or failed delivery appears in the list for review, rather than risking repeated notifications. Reminders more than a day overdue appear as missed. Use `doin remind retry N` to authorize one retry on the next check. Notification commands have a five-second timeout and clean up their own process group.
+
+Scheduling a reminder uses the existing Markdown lock, atomic write, and undo. The delivery sidecar is updated only after the Markdown commit. A storage error can therefore leave a portable scheduled comment without local delivery history; a later check discovers it safely. Undo restores the Markdown; it does not erase the device's delivery history.
+
+Verification uses the real CLI with isolated configuration, fake notification and scheduler executables, DST changes, Markdown edits, duplicate IDs, concurrent checks, and a hung notifier that forks a child. No system notifications or persistent agents are installed by the harness. Reproduce with `python3 tests/reminders_e2e.py --bin zig-out/bin/doin`; evidence is written under `artifacts/reminders`.
+
+Implementation references: [Apple LaunchAgent guidance](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html), [Apple notifications](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html), [Apple time conversion](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/mktime.3.html), and the [freedesktop notification specification](https://specifications.freedesktop.org/notification/latest/).
+
+Linux scheduler/calendar failure census: missing user systemd session; malformed unit quoting/specifier expansion; activation failure leaves enabled state; disable/daemon-reload outage; notifier needs a desktop session; repeated timer checks compete for existing reminder claims; invalid leap dates, DST gaps/ambiguity, offset conversion, midnight/week/month boundaries; Windows timezone ABI and annual rule differences. Existing reminder E2E covers metadata/claims and DST; the isolated scheduler driver covers generated Linux units against fake `systemctl` without registering real jobs.
+
+Windows scheduler/notification failure census (before adapter): a task targets another user; elevated credentials or stored passwords; XML/argument injection from paths; duplicate task ownership; a stale pinned folder; unavailable Task Scheduler; registration succeeds but state persistence fails; disable fails while future ticks must remain off; notification text becomes executable PowerShell; missing interactive desktop or toast app identity; hung PowerShell descendants; private temporary payload leakage; scheduler XML remains after rollback. Windows E2E must distinguish generated-task acceptance from actual desktop toast visibility and must delete only its isolated task name.
+
+
+Scheduler commands preserve an existing installation rather than overwriting another registration. The job records the exact configured folder; changing folders makes stale checks fail closed. Linux units use `Type=oneshot`, `KillMode=control-group`, a 50-second limit and `OnUnitInactiveSec=60s`; Windows tasks use the actual process-token user SID, `InteractiveToken`, `LeastPrivilege`, `IgnoreNew` and a 50-second limit. No password or elevated identity is stored. All helper commands have a five-second deadline and kill their exact owned process group or Windows Job Object.
+
+Windows notification text is serialized to a private JSON payload, never interpolated into PowerShell source. A fixed private script calls `NotifyIcon.ShowBalloonTip` with the title doin and disposes its taskbar icon; OS accessibility and notification settings determine visibility and duration. A successful helper submission cannot prove the user saw it. Notification payload/script files are deleted after success or failure. Windows timezone conversion uses native annual timezone rules; ambiguous and nonexistent local times require an explicit offset.
+
+The native macOS reminder E2E passes six groups, including DST gaps/folds and hung notifier descendants. `tests/scheduler_e2e.py` executes the compiled scheduler module against fake systemctl and records generated units plus activation rollback/disable receipts in `artifacts/scheduler`; this proves unit generation and lifecycle requests, not a live Linux desktop. Windows runtime acceptance is recorded separately by the Windows runner; a crosscompile alone does not establish notification visibility.
+
+Primary references: [systemd service configuration](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml), [systemd timer configuration](https://github.com/systemd/systemd/blob/main/man/systemd.timer.xml), [Task Scheduler schema](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-schema), [schtasks](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-create), [NotifyIcon.ShowBalloonTip](https://learn.microsoft.com/en-us/dotnet/api/system.windows.forms.notifyicon.showballoontip), [Windows annual timezone rules](https://learn.microsoft.com/en-us/windows/win32/api/timezoneapi/nf-timezoneapi-gettimezoneinformationforyear), and [native UTC-to-local conversion](https://learn.microsoft.com/en-us/windows/win32/api/timezoneapi/nf-timezoneapi-systemtimetotzspecificlocaltimeex).
+
+Linux CI fixture correction (2026-10-03): the reminder suite now exercises supported systemd user-timer registration using an isolated unit directory and a fake `systemctl`, including registration failure rollback, disable cleanup, and subsequent notifier interruption. It never invokes the host service manager. The previous non-macOS unsupported assertion was stale and left the successful Linux scheduler enabled inside the fixture. macOS seven-group regression passed; Linux rerun remains pending CI. Timer behavior is checked against the current [systemd timer primary source](https://github.com/systemd/systemd/blob/main/man/systemd.timer.xml) and [oneshot service primary source](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml).
+
+Windows scheduler encoding regression: captured real `schtasks /Create /XML` rejected the UTF-8 declaration with “unable to switch the encoding”. Task XML now serializes as UTF-16LE with a BOM and matching UTF-16 declaration, preserving Unicode paths, XML escaping and private-file protection. The real Windows runner retains `scheduler.xml` before rollback and exercises register/query/delete. [Microsoft RegisterTask](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itaskfolder-registertask) defines the XML input as BSTR; [Microsoft XML task registration example](https://learn.microsoft.com/en-us/windows/win32/taskschd/time-trigger-example--xml-) documents the schtasks registration path. Actual Windows rerun is pending.

@@ -1,0 +1,86 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build small executable
+        run: zig build -j1 -Doptimize=ReleaseSmall
+      - name: Real executable behavior tests
+        run: |
+          python3 tests/e2e.py
+          python3 tests/auth_e2e.py
+          python3 tests/tui_e2e.py
+          python3 tests/reflow_e2e.py
+          python3 tests/productivity_e2e.py
+          python3 tests/reminders_e2e.py
+          python3 tests/sync_client_e2e.py
+          python3 tests/mcp_e2e.py
+          python3 tests/mcp_client_e2e.py
+          python3 tests/mcp_cloud_client_e2e.py
+          python3 tests/folders_e2e.py
+          python3 tests/properties_e2e.py
+          python3 tests/agent_guidance_e2e.py
+          python3 tests/commands_pty_e2e.py
+          python3 tests/ai_tools_e2e.py
+          python3 tests/streaming_e2e.py
+          python3 tests/auto_sync_e2e.py
+          python3 tests/library_sync_e2e.py
+          python3 tests/team_client_e2e.py
+          python3 tests/mcp_oauth_cli_e2e.py
+          python3 tests/reminder_interrupt_e2e.py
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Verify Worker and native client together
+        run: |
+          npm ci --prefix cloud
+          npm test --prefix cloud
+          python3 tests/sync_client_e2e.py --worker
+      - name: Upload reproducible evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-evidence
+          path: artifacts/
+          if-no-files-found: warn
+      - name: Upload Worker evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-evidence
+          path: cloud/artifacts/
+          if-no-files-found: warn
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build native Windows executable
+        run: zig build -j1 -Doptimize=ReleaseSmall
+      - name: Real Windows console and MCP behavior
+        run: |
+          New-Item -ItemType Directory -Force artifacts/windows-e2e | Out-Null
+          zig build-exe --dep platform '-Mroot=tests/platform_driver.zig' '-Mplatform=src/platform.zig' -lc -ladvapi32 -lshell32 '-femit-bin=artifacts/windows-e2e/platform-driver.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/windows_e2e.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File tests/windows_install_e2e.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-evidence
+          path: artifacts/windows-e2e/

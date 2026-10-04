@@ -1,0 +1,20 @@
+{
+  "name": "doin-sync",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/e2e.mjs && node tests/mcp-e2e.mjs && node tests/mcp-oauth-e2e.mjs && node tests/team-e2e.mjs && node tests/folders-e2e.mjs && node tests/personal-folders-e2e.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "miniflare": "5.20261001.0-alpha",
+    "wrangler": "4.147.0"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.1",
+    "@modelcontextprotocol/client": "2.3.0",
+    "@modelcontextprotocol/server": "2.3.0"
+  }
+}

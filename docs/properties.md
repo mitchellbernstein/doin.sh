@@ -1,0 +1,19 @@
+# Custom properties
+
+Failure census before implementation: duplicate/renamed schema identity; renamed select options losing task values; malformed comments; metadata inside Markdown fences; HTML-comment injection; duplicate per-task comments; invalid numeric/nonfinite/date/boolean values; unknown select options; duplicate multi-select values; schema changes destroying populated data; removals without review; unknown Markdown/reminders/status/task IDs lost during edits; stale external edits; undo; missing schema/value sync/export; former member identities; cross-team assignment.
+
+Properties remain portable within tasks.md. Schema is a standalone `<!-- doin:properties=JSON -->` comment outside fences; values are `<!-- doin:values=JSON -->` on actual task lines. JSON angle brackets are Unicode escaped. Property and select-option identifiers remain stable across label renames. Unknown task content is preserved; no separate schema file is created.
+
+Proposed commands: `properties list`, `properties add NAME TYPE [OPTIONS]`, `properties rename PROPERTY NAME`, `properties type PROPERTY TYPE [clear]`, `properties options PROPERTY add NAME`, `properties options PROPERTY rename OPTION NAME`, `properties options PROPERTY remove OPTION [clear]`, `properties remove PROPERTY`; `set TASK PROPERTY VALUE`; `unset TASK PROPERTY`; `filter property PROPERTY VALUE`.
+
+Types: text (string alias), finite number, calendar date YYYY-MM-DD, single_select, multi_select, boolean true/false. Select options use comma-separated labels at creation and multi-select input. CLI quoting supports spaces in labels. Incompatible populated type changes require `clear`, and affected data is shown in the proposal before the main command's confirmation/undo write boundary. Reserved member properties accept catalog-bound account identifiers through the team adapter.
+
+Source and native CLI integration verified2026-10-03: the strengthened real-CLI E2E passed seven groups and46 commands. Reproduce `python3 tests/properties_e2e.py zig-out/bin/doin`; receipt `artifacts/properties-e2e/report.json` retains command outputs and the resulting tasks.md on success or failure.
+
+Multi-select filters match all requested options regardless of order; a one-option query matches tasks containing that option among others. Removing an unused option preserves every task value. Explicitly clearing a used option removes only that option from multi-select arrays. The reserved member property cannot be changed through ordinary schema commands; team assignment uses a validated member catalog. Cached member names are display data while account IDs remain authoritative.
+
+Properties and stable assignee task identity precede the final reminder marker, so status and reminder edits preserve their opaque comments. Team assignment identity uses a separate doin:task marker and does not replace reminder doin:id.
+
+Schema type changes, property removal, and option removal show the proposal and ask for confirmation. `--yes` explicitly approves these operations for scripts. Add/rename/set/unset apply immediately and keep undo. Guided `/properties` and `/set` use task/property/type/option pickers with arrows, Tab and Enter; multi-select toggles choices then Done, and Escape cancels. Task rows show compact summaries only for populated fields.
+
+Review added real regression scenarios for: first property insertion retaining actual reminder recognition and due time; reminder set/off retaining properties and stable ID; unused and used multi-select option removal; stale external edits; symlink replacement and configured-storage switches during destructive preview. The latest strengthened run passed all seven groups, including both path/context races and reminder recognition. Receipt: artifacts/properties-e2e/report.json; timestamped receipts preserve earlier failures separately.
