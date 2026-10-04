@@ -10,3 +10,8 @@ __pycache__/
 
 cloud/.wrangler.personal.jsonc
 cloud/.wrangler.commercial.jsonc
+
+# Apple app source is maintained in the private doin.sh-gui repository.
+/ios/
+/macos/
+/script/
