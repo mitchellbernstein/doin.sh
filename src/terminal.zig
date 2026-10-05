@@ -8,6 +8,7 @@ const white = "\x1b[38;2;255;255;255m";
 const assistant = "\x1b[38;2;208;208;208m";
 const band = "\x1b[48;2;36;36;36m";
 const bold = "\x1b[1m";
+const command_options = [_][]const u8{ "/add", "/ask", "/done", "/generate", "/help", "/list", "/ls", "/model", "/note", "/quit", "/exit", "/reopen", "/undo", "/voice", "/sync", "/account", "/provider", "/settings", "/review", "/prioritize", "/visualize", "/delete", "/clear", "/config", "/path", "/focus", "/update", "/upgrade", "/remind", "/today", "/week", "/month", "/filter", "/status", "/mark", "/unblock", "/statuses", "/mcp", "/folder", "/team", "/assist", "/properties", "/set", "/unset", "/assign", "/agents" };
 var interrupted = std.atomic.Value(bool).init(false);
 
 var transcript: [65536]u8 = undefined;
@@ -65,6 +66,9 @@ fn sessionSignal(_: c_int) callconv(.c) void {
     if (pid > 0) platform.killDirect(if (platform.windows) @ptrFromInt(pid) else pid);
 }
 var reserved: usize = 4;
+var command_menu_rows: usize = 0;
+var command_menu_active = false;
+var command_menu_selected: usize = 0;
 var dock_height: usize = 0;
 var dock_width: usize = 0;
 pub var empty_placeholder = false;
@@ -80,6 +84,35 @@ fn margins(a: Allocator, reserve: usize) !void {
     try write(sequence);
     reserved = reserve;
 }
+const CommandMatches = struct { indices: [command_options.len]usize = undefined, len: usize = 0 };
+fn menuMatches(text: []const u8, cursor: usize, active: bool) CommandMatches {
+    var matches: CommandMatches = .{};
+    if (!active or cursor != text.len or text.len == 0 or text[0] != '/' or std.mem.indexOfScalar(u8, text, ' ') != null or std.mem.indexOfScalar(u8, text, '\t') != null) return matches;
+    for (command_options, 0..) |command, index| if (std.mem.startsWith(u8, command, text)) {
+        matches.indices[matches.len] = index;
+        matches.len += 1;
+    };
+    return matches;
+}
+fn menuGhost(text: []const u8, matches: CommandMatches) []const u8 {
+    if (matches.len == 0 or command_menu_selected >= matches.len) return "";
+    return command_options[matches.indices[command_menu_selected]][text.len..];
+}
+fn syncCommandMenu(a: Allocator, count: usize) !void {
+    if (!docked) return;
+    if (count == command_menu_rows) return;
+    if (command_menu_rows > 0) {
+        try margins(a, 4);
+        command_menu_rows = 0;
+        const output_height = rows() -| 4;
+        try clearRows(a, 1, output_height);
+        try replayOutput(a, output_height, columns());
+    }
+    if (count > 0) {
+        command_menu_rows = count;
+        try margins(a, 4 + count);
+    }
+}
 pub fn sessionStart(a: Allocator) !void {
     if (!rich()) return;
     // Start a fresh viewport without clearing native terminal history.
@@ -93,6 +126,7 @@ pub fn sessionStart(a: Allocator) !void {
     dock_height = rows();
     dock_width = columns();
     reserved = if (docked) 4 else 1;
+    command_menu_rows = 0;
     if (rows() > reserved) try margins(a, reserved);
     try cursorAt(a, 1, 1);
 }
@@ -409,6 +443,7 @@ pub const Editor = struct {
     pending: ?[]const u8 = null,
     pending_byte: ?u8 = null,
     pending_cursor: ?usize = null,
+    pending_command_selection: ?usize = null,
     pub fn init(a: Allocator) Editor {
         return .{ .allocator = a };
     }
@@ -447,13 +482,32 @@ pub const Editor = struct {
         return a.dupe(u8, std.mem.trim(u8, text.items, " \r\t"));
     }
     fn repaint(a: Allocator, text: []const u8, cursor: usize, label: []const u8, hint: []const u8, redraw: bool, focus: ?struct { start: usize, end: usize }) !void {
+        const matches = menuMatches(text, cursor, command_menu_active);
+        var menu_rows: usize = 0;
+        var option_rows: usize = 0;
+        var scrolled = false;
+        if (docked and matches.len > 0) {
+            menu_rows = @min(6, rows() -| 9);
+            scrolled = matches.len > menu_rows;
+            option_rows = menu_rows - @intFromBool(scrolled);
+            menu_rows = @min(matches.len, menu_rows);
+        }
+        if (matches.len > 0) command_menu_selected = @min(command_menu_selected, matches.len - 1) else command_menu_selected = 0;
+        try syncCommandMenu(a, menu_rows);
         if (session_wanted and !docked) {
             const available = columns() -| 3;
             var start: usize = 0;
             while (start < cursor and width(text[start..cursor]) >= available) start = next(text, start);
             try cursorAt(a, rows(), 1);
             try write("\r\x1b[2K› ");
-            try write(fit(text[start..], available));
+            const input = fit(text[start..], available);
+            try write(input);
+            const ghost = fit(menuGhost(text, matches), available -| width(input));
+            if (ghost.len > 0) {
+                try write(muted);
+                try write(ghost);
+                try write(reset);
+            }
             try cursorAt(a, rows(), 3 + width(text[start..cursor]));
             return;
         }
@@ -463,7 +517,37 @@ pub const Editor = struct {
         while (start < cursor and width(text[start..cursor]) > inside -| 1) start = next(text, start);
         const marker: usize = if (start > 0) 1 else 0;
         const visible = fit(text[start..], inside - marker);
-        const pad = inside -| marker -| width(visible);
+        const ghost = fit(menuGhost(text, matches), inside -| marker -| width(visible));
+        const pad = inside -| marker -| width(visible) -| width(ghost);
+        var suggestions: std.ArrayList(u8) = .empty;
+        defer suggestions.deinit(a);
+        if (focus == null and matches.len > 0 and !docked) {
+            for (matches.indices[0..@min(matches.len, 8)], 0..) |index, i| {
+                if (i > 0) try suggestions.appendSlice(a, "  ");
+                try suggestions.appendSlice(a, command_options[index]);
+            }
+        }
+        const command_hint = if (focus == null and matches.len > 0) (if (docked) "↑↓ choose · Tab complete · Enter run · Esc close" else suggestions.items) else hint;
+        if (menu_rows > 0) {
+            const options_to_show = if (scrolled) option_rows else menu_rows;
+            const start_index = command_menu_selected -| (options_to_show / 2);
+            const first = @min(start_index, matches.len -| options_to_show);
+            for (0..options_to_show) |row| {
+                try cursorAt(a, rows() - 3 - menu_rows + row, 1);
+                try write("\r\x1b[2K  ");
+                if (matches.indices[first + row] == matches.indices[command_menu_selected]) try write(band ++ white ++ "› ") else try write(muted ++ "  ");
+                try write(command_options[matches.indices[first + row]]);
+                try write(reset);
+            }
+            if (scrolled) {
+                try cursorAt(a, rows() - 4, 1);
+                try write("\r\x1b[2K  " ++ muted);
+                const more = try std.fmt.allocPrint(a, "↑↓ choose · {d} more", .{matches.len - option_rows});
+                defer a.free(more);
+                try write(fit(more, columns() -| 4));
+                try write(reset);
+            }
+        }
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(a);
         if (docked) {
@@ -491,11 +575,15 @@ pub const Editor = struct {
             try frame.appendSlice(a, reset);
             try frame.appendSlice(a, visible[to..]);
         } else try frame.appendSlice(a, visible);
+        if (focus == null and ghost.len > 0) {
+            try frame.appendSlice(a, muted);
+            try frame.appendSlice(a, ghost);
+            try frame.appendSlice(a, reset);
+        }
         for (0..pad) |_| try frame.append(a, ' ');
         try frame.appendSlice(a, " " ++ accent ++ "│" ++ reset ++ "\r\n\x1b[2K  " ++ accent ++ "╰");
         for (0..box_width - 2) |_| try frame.appendSlice(a, "─");
         try frame.appendSlice(a, "╯" ++ reset ++ "\r\n\x1b[2K  " ++ muted);
-        const command_hint = if (focus == null and std.mem.startsWith(u8, text, "/")) "/add  /done  /ask  /generate  /model  /account  /help  /quit" else hint;
         try frame.appendSlice(a, fit(command_hint, columns() -| 4));
         try frame.appendSlice(a, if (docked) reset ++ "\r\x1b[2A" else reset ++ "\r\n\x1b[3A\r");
         const position = try std.fmt.allocPrint(a, "\x1b[{d}C", .{6 + marker + width(text[start..cursor])});
@@ -553,6 +641,14 @@ pub const Editor = struct {
         }
         var cursor: usize = @min(text.items.len, self.pending_cursor orelse text.items.len);
         self.pending_cursor = null;
+        command_menu_selected = self.pending_command_selection orelse 0;
+        self.pending_command_selection = null;
+        var menu_dismissed = false;
+        command_menu_active = menuMatches(text.items, cursor, true).len > 0;
+        defer {
+            command_menu_active = false;
+            syncCommandMenu(self.allocator, 0) catch {};
+        }
         var selected = self.history.items.len;
         var draft: ?[]const u8 = null;
         defer if (draft) |v| self.allocator.free(v);
@@ -588,10 +684,12 @@ pub const Editor = struct {
                 resized = true;
                 try self.setDraft(text.items);
                 self.pending_cursor = cursor;
+                self.pending_command_selection = command_menu_selected;
                 self.pending_byte = maybe;
                 return error.TerminalResized;
             }
             const byte = maybe orelse continue;
+            var changed_draft = false;
             interacted = true;
             if (art_painted) {
                 try idleArt(a, 0, true);
@@ -617,39 +715,47 @@ pub const Editor = struct {
                     if (count >= 2 and (std.ascii.isAlphabetic(seq[count - 1]) or seq[count - 1] == '~')) break;
                 }
                 const key = seq[0..count];
-                if (std.mem.eql(u8, key, "[200~")) pasted = true else if (std.mem.eql(u8, key, "[201~")) pasted = false else if (std.mem.eql(u8, key, "[D") or std.mem.eql(u8, key, "OD")) cursor = prev(text.items, cursor) else if (std.mem.eql(u8, key, "[C") or std.mem.eql(u8, key, "OC")) cursor = next(text.items, cursor) else if (std.mem.eql(u8, key, "[H") or std.mem.eql(u8, key, "OH") or std.mem.eql(u8, key, "[1~")) cursor = 0 else if (std.mem.eql(u8, key, "[F") or std.mem.eql(u8, key, "OF") or std.mem.eql(u8, key, "[4~")) cursor = text.items.len else if (std.mem.eql(u8, key, "[3~")) erase(&text, cursor, next(text.items, cursor)) else if (history and (std.mem.eql(u8, key, "[A") or std.mem.eql(u8, key, "[B"))) {
-                    if (draft == null) draft = try self.allocator.dupe(u8, text.items);
-                    if (key[1] == 'A' and selected > 0) selected -= 1 else if (key[1] == 'B' and selected < self.history.items.len) selected += 1;
-                    text.clearRetainingCapacity();
-                    try text.appendSlice(self.allocator, if (selected == self.history.items.len) draft.? else self.history.items[selected]);
-                    cursor = text.items.len;
-                }
+                if (std.mem.eql(u8, key, "[200~")) pasted = true else if (std.mem.eql(u8, key, "[201~")) pasted = false else if (std.mem.eql(u8, key, "[D") or std.mem.eql(u8, key, "OD")) cursor = prev(text.items, cursor) else if (std.mem.eql(u8, key, "[C") or std.mem.eql(u8, key, "OC")) cursor = next(text.items, cursor) else if (std.mem.eql(u8, key, "[H") or std.mem.eql(u8, key, "OH") or std.mem.eql(u8, key, "[1~")) cursor = 0 else if (std.mem.eql(u8, key, "[F") or std.mem.eql(u8, key, "OF") or std.mem.eql(u8, key, "[4~")) cursor = text.items.len else if (std.mem.eql(u8, key, "[3~")) erase(&text, cursor, next(text.items, cursor)) else if ((history or command_menu_active) and (std.mem.eql(u8, key, "[A") or std.mem.eql(u8, key, "[B"))) {
+                    const matches = menuMatches(text.items, cursor, command_menu_active and !pasted);
+                    if (matches.len > 0) {
+                        if (key[1] == 'A' and command_menu_selected > 0) command_menu_selected -= 1 else if (key[1] == 'B' and command_menu_selected + 1 < matches.len) command_menu_selected += 1;
+                    } else {
+                        if (draft == null) draft = try self.allocator.dupe(u8, text.items);
+                        if (key[1] == 'A' and selected > 0) selected -= 1 else if (key[1] == 'B' and selected < self.history.items.len) selected += 1;
+                        text.clearRetainingCapacity();
+                        try text.appendSlice(self.allocator, if (selected == self.history.items.len) draft.? else self.history.items[selected]);
+                        cursor = text.items.len;
+                        changed_draft = true;
+                    }
+                } else if (key.len == 0) menu_dismissed = true;
+                if (std.mem.eql(u8, key, "[3~")) changed_draft = true;
             } else if (byte == 127 or byte == 8) {
                 const from = prev(text.items, cursor);
                 erase(&text, from, cursor);
                 cursor = from;
+                changed_draft = true;
             } else if (byte == 1) cursor = 0 else if (byte == 5) cursor = text.items.len else if (byte == 21) {
                 erase(&text, 0, cursor);
                 cursor = 0;
-            } else if (byte == 11) erase(&text, cursor, text.items.len) else if (byte == 23) {
+                changed_draft = true;
+            } else if (byte == 11) {
+                erase(&text, cursor, text.items.len);
+                changed_draft = true;
+            } else if (byte == 23) {
                 var from = cursor;
                 while (from > 0 and text.items[from - 1] == ' ') from -= 1;
                 while (from > 0 and text.items[from - 1] != ' ') from = prev(text.items, from);
                 erase(&text, from, cursor);
                 cursor = from;
+                changed_draft = true;
             } else if (byte == 9 and !pasted and text.items.len > 0 and text.items[0] == '/') {
-                const commands = [_][]const u8{ "/add", "/ask", "/done", "/generate", "/help", "/list", "/model", "/note", "/quit", "/reopen", "/undo", "/voice", "/sync", "/account", "/provider", "/settings", "/review", "/prioritize", "/visualize", "/delete", "/clear", "/upgrade", "/remind", "/today", "/week", "/month", "/filter", "/status", "/mark", "/unblock", "/statuses", "/mcp", "/folder", "/team", "/assist", "/properties", "/set", "/unset", "/assign", "/agents" };
-                var match: ?[]const u8 = null;
-                var matches: usize = 0;
-                for (commands) |command| if (std.mem.startsWith(u8, command, text.items)) {
-                    match = command;
-                    matches += 1;
-                };
-                if (matches == 1) {
+                const matches = menuMatches(text.items, cursor, command_menu_active);
+                if (matches.len > 0) {
                     text.clearRetainingCapacity();
-                    try text.appendSlice(self.allocator, match.?);
+                    try text.appendSlice(self.allocator, command_options[matches.indices[@min(command_menu_selected, matches.len - 1)]]);
                     try text.append(self.allocator, ' ');
                     cursor = text.items.len;
+                    changed_draft = true;
                 }
             } else if (byte >= 32 or (pasted and (byte == '\r' or byte == '\n' or byte == '\t'))) {
                 var bytes: [4]u8 = undefined;
@@ -666,14 +772,20 @@ pub const Editor = struct {
                 if (text.items.len + count > 8192) continue;
                 try text.insertSlice(self.allocator, cursor, bytes[0..count]);
                 cursor += count;
+                changed_draft = true;
             }
+            if (changed_draft) {
+                menu_dismissed = false;
+                command_menu_selected = 0;
+            }
+            command_menu_active = !menu_dismissed and !pasted and menuMatches(text.items, cursor, true).len > 0;
             try repaint(self.allocator, text.items, cursor, label, hint, true, null);
         }
     }
 };
 
 pub const ModelOption = struct { value: []const u8, label: []const u8, detail: []const u8 = "" };
-pub const ModelField = struct { name: []const u8, prefix: []const u8, suffix: []const u8, placeholder: []const u8, initial: []const u8 = "", options: []const ModelOption, explanation: []const u8, selection_only: bool = false, directory_mode: bool = false, directory_state: ?*DirectoryState = null };
+pub const ModelField = struct { name: []const u8, prefix: []const u8, suffix: []const u8, placeholder: []const u8, initial: []const u8 = "", options: []const ModelOption, explanation: []const u8, selection_only: bool = false, escape_back: bool = false, directory_mode: bool = false, directory_state: ?*DirectoryState = null };
 pub const DirectoryState = struct { query: std.ArrayList(u8) = .empty, selected: usize = 0, allocator: Allocator };
 pub const DirectoryNavigation = enum { none, parent, back, forward, open };
 pub const ModelChoice = struct { value: []const u8, back: bool = false, tab: bool = false, navigation: DirectoryNavigation = .none };
@@ -683,8 +795,8 @@ fn containsFold(text: []const u8, needle: []const u8) bool {
     for (0..text.len - needle.len + 1) |i| if (std.ascii.eqlIgnoreCase(text[i .. i + needle.len], needle)) return true;
     return false;
 }
-fn pickerClear(a: Allocator, option_rows: usize) !void {
-    const height = option_rows + 6;
+fn pickerClear(a: Allocator, option_rows: usize, compact_selection: bool) !void {
+    const height = option_rows + (if (compact_selection) @as(usize, 4) else 6);
     if (docked) {
         try clearRows(std.heap.page_allocator, rows() - (height - 1), height);
         try popupDock(std.heap.page_allocator, 4);
@@ -695,7 +807,7 @@ fn pickerClear(a: Allocator, option_rows: usize) !void {
         }
         return;
     }
-    try write(try std.fmt.allocPrint(a, "\r\x1b[{d}A", .{option_rows + 3}));
+    try write(try std.fmt.allocPrint(a, "\r\x1b[{d}A", .{option_rows + (if (compact_selection) @as(usize, 2) else 3)}));
     for (0..height) |i| {
         try write("\x1b[2K");
         if (i + 1 < height) try write("\x1b[1B\r");
@@ -734,8 +846,11 @@ pub fn modelPick(a: Allocator, field_spec: ModelField) !ModelChoice {
         try heading(a, field_spec.name);
         for (field_spec.options, 0..) |option, index| try line(a, try std.fmt.allocPrint(a, "  {d}  ", .{index + 1}), option.label);
         try systemLine(a, "  ", field_spec.explanation);
-        const answer_text = try Editor.plain(a, "Choice [1; Escape cancels]:");
-        if (std.mem.indexOfScalar(u8, answer_text, 27) != null) return error.PickerCancelled;
+        const answer_text = try Editor.plain(a, if (field_spec.escape_back) "Choice [1; Escape goes back]:" else "Choice [1; Escape cancels]:");
+        if (std.mem.indexOfScalar(u8, answer_text, 27) != null) {
+            if (field_spec.escape_back) return .{ .value = "", .back = true };
+            return error.PickerCancelled;
+        }
         const index = if (answer_text.len == 0) 1 else std.fmt.parseInt(usize, answer_text, 10) catch return error.InvalidModelChoice;
         if (index == 0 or index > field_spec.options.len) return error.InvalidModelChoice;
         return .{ .value = field_spec.options[index - 1].value };
@@ -747,8 +862,12 @@ pub fn modelPick(a: Allocator, field_spec: ModelField) !ModelChoice {
     const signals = try platform.SignalGuard.install(signal);
     defer signals.restore();
     const option_rows: usize = if (field_spec.selection_only) @max(1, @min(field_spec.options.len, rows() -| 7)) else 3;
-    const picker_height = option_rows + 6;
-    if (docked) try popupDock(a, picker_height);
+    const compact_selection = field_spec.selection_only and !field_spec.directory_mode;
+    const picker_height = option_rows + (if (compact_selection) @as(usize, 4) else 6);
+    if (docked) {
+        try popupDock(a, picker_height);
+        if (compact_selection) try clearRows(std.heap.page_allocator, rows() - (picker_height - 1), picker_height);
+    }
     var query: std.ArrayList(u8) = .empty;
     defer query.deinit(a);
     if (field_spec.directory_state) |state| try query.appendSlice(a, state.query.items);
@@ -773,7 +892,7 @@ pub fn modelPick(a: Allocator, field_spec: ModelField) !ModelChoice {
     var pasted = false;
     try write("\x1b[?2004h");
     defer {
-        if (painted and !resized) pickerClear(a, option_rows) catch {};
+        if (painted and !resized) pickerClear(a, option_rows, compact_selection) catch {};
         if (resized) resizeDock(a) catch {};
         write(reset ++ "\x1b[?2004l\x1b[?25h") catch {};
     }
@@ -793,7 +912,7 @@ pub fn modelPick(a: Allocator, field_spec: ModelField) !ModelChoice {
                 if ((action and query.items.len == 0) or (!action and (containsFold(option.label, query.items) or (!field_spec.directory_mode and containsFold(option.value, query.items))))) try matches.append(a, index);
             }
             selected = @min(selected, matches.items.len -| 1);
-            if (docked) try cursorAt(a, rows() - (picker_height - 1), 1) else if (painted) try write(try std.fmt.allocPrint(a, "\r\x1b[{d}A", .{option_rows + 3}));
+            if (docked) try cursorAt(a, rows() - (picker_height - 1), 1) else if (painted) try write(try std.fmt.allocPrint(a, "\r\x1b[{d}A", .{option_rows + (if (compact_selection) @as(usize, 2) else 3)}));
             try write("\r\x1b[2K  " ++ muted);
             const clean_heading = try clean(a, field_spec.name, false);
             defer a.free(clean_heading);
@@ -822,7 +941,13 @@ pub fn modelPick(a: Allocator, field_spec: ModelField) !ModelChoice {
             const active = if (query.items.len > 0) query.items else field_spec.placeholder;
             const input_text = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ field_spec.prefix, active, field_spec.suffix });
             defer a.free(input_text);
-            try Editor.repaint(a, input_text, field_spec.prefix.len + query.items.len, "", if (field_spec.directory_mode) "↑↓ · →/Enter open · ← parent · Alt←/→ history · type filter · Esc cancel" else if (field_spec.selection_only) "↑↓ choose · Enter accept · 1–9 select · Esc cancel" else "Tab next · Shift+Tab back · ↑↓ choose · Enter accept · Esc cancel", false, .{ .start = field_spec.prefix.len, .end = field_spec.prefix.len + active.len });
+            if (compact_selection) {
+                try write("\r\x1b[2K  " ++ muted ++ "↑↓ choose · Enter accept · 1–9 select · Esc ");
+                try write(if (field_spec.escape_back) "back" else "cancel");
+                try write(reset);
+            } else {
+                try Editor.repaint(a, input_text, field_spec.prefix.len + query.items.len, "", if (field_spec.directory_mode) "↑↓ · →/Enter open · ← parent · Alt←/→ history · type filter · Esc cancel" else if (field_spec.selection_only) "↑↓ choose · Enter accept · 1–9 select · Esc cancel" else "Tab next · Shift+Tab back · ↑↓ choose · Enter accept · Esc cancel", false, .{ .start = field_spec.prefix.len, .end = field_spec.prefix.len + active.len });
+            }
             painted = true;
             dirty = false;
         }
@@ -830,7 +955,10 @@ pub fn modelPick(a: Allocator, field_spec: ModelField) !ModelChoice {
         dirty = true;
         if (byte == 3 or byte == 4) return error.InputClosed;
         if (byte == 27) {
-            const next_byte = (try Editor.readByte(30)) orelse return error.PickerCancelled;
+            const next_byte = (try Editor.readByte(30)) orelse {
+                if (field_spec.escape_back) return .{ .value = "", .back = true };
+                return error.PickerCancelled;
+            };
             if (next_byte != '[') continue;
             var key_bytes: [16]u8 = undefined;
             var key_len: usize = 0;

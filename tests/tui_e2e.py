@@ -6,6 +6,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--bin', default='zig-out/bin/doin')
 parser.add_argument('--artifacts', default='artifacts/tui-e2e')
 parser.add_argument('--baseline', default='')
+parser.add_argument('--case', help='Run only the exact named E2E case')
 args = parser.parse_args()
 binary = pathlib.Path(args.bin).resolve(); artifacts = pathlib.Path(args.artifacts).resolve(); artifacts.mkdir(parents=True, exist_ok=True)
 cases, requests, captures, restorations = [], [], [], []
@@ -218,19 +219,26 @@ active = []
 with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
     root = pathlib.Path(temp).resolve(); storage = root / 'tasks space'; config = root / 'config'; env = dict(os.environ, TERM='xterm-256color', DOIN_CONFIG_DIR=str(config))
     real_curl=shutil.which('curl'); assert real_curl
-    guard_dir=root/'network-guard'; guard_dir.mkdir(); guard_log=root/'blocked-network.log'
+    guard_dir=root/'network-guard'; guard_dir.mkdir(); guard_log=root/'blocked-network.log'; browser_guard_log=root/'blocked-browser.jsonl'
     guard=guard_dir/'curl'
     guard.write_text('#!'+sys.executable+'\nimport os,sys,urllib.parse\nfrom pathlib import Path\nurls=[v for v in sys.argv[1:] if v.startswith(("http://","https://"))]\nif not urls or any(urllib.parse.urlsplit(v).hostname not in ("localhost","127.0.0.1","::1") for v in urls):\n with Path(os.environ["TUI_NETWORK_GUARD_LOG"]).open("a") as f:f.write("blocked\\n")\n sys.exit(97)\nos.execv(os.environ["TUI_REAL_CURL"],[os.environ["TUI_REAL_CURL"],*sys.argv[1:]])\n')
     guard.chmod(0o700)
-    env.update(PATH=str(guard_dir)+os.pathsep+env['PATH'],TUI_REAL_CURL=real_curl,TUI_NETWORK_GUARD_LOG=str(guard_log))
+    for executable in ('open', 'xdg-open'):
+        browser_guard=guard_dir/executable
+        browser_guard.write_text('#!'+sys.executable+'\nimport json,os,sys\nfrom pathlib import Path\nwith Path(os.environ["TUI_BROWSER_GUARD_LOG"]).open("a") as f:f.write(json.dumps({"command":Path(sys.argv[0]).name,"argv":sys.argv[1:]})+"\\n")\nsys.exit(97)\n')
+        browser_guard.chmod(0o700)
+    env.update(PATH=str(guard_dir)+os.pathsep+env['PATH'],TUI_REAL_CURL=real_curl,TUI_NETWORK_GUARD_LOG=str(guard_log),TUI_BROWSER_GUARD_LOG=str(browser_guard_log))
     denied=subprocess.run([str(guard),'--url','https://example.invalid'],env=env,capture_output=True)
     assert denied.returncode==97 and guard_log.read_text()=='blocked\n','Nonfixture denial guard failed'
+    denied_browser=subprocess.run([str(guard_dir/'open'),'https://example.invalid'],env=env,capture_output=True)
+    assert denied_browser.returncode==97 and json.loads(browser_guard_log.read_text())=={'command':'open','argv':['https://example.invalid']},'Browser denial guard failed'
     env.pop('NO_COLOR', None)
     subprocess.run([str(binary), 'init', '--storage', str(storage), '--provider', 'manual'], env=env, check=True, capture_output=True)
     taskfile = storage / 'tasks.md'
     original = '# Launch café\n\n## This week\n\n- [ ] Review migration with the operations team before the long deployment window\n  - [ ] Verify 東京 backup 🚀\n- [x] Capture baseline\n\n```markdown\n- [ ] Example only\n```\n\n## Personal\n\n- [ ] Buy groceries\n'
     taskfile.write_text(original)
     def case(name, fn):
+        if args.case and name != args.case: return
         try: fn(); cases.append({'name': name, 'passed': True})
         except Exception: cases.append({'name': name, 'passed': False, 'failure': traceback.format_exc()})
     def start(executable=binary, custom_env=None, cols=88, rows=32):
@@ -269,6 +277,38 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
             t.capture('manual-exit')
         finally: t.close(); active.remove(t)
     case('sectioned task board, Unicode editing/delete, history draft, completion, paste, resize and Ctrl+C restore', manual)
+
+    def slash_commands():
+        t = start()
+        try:
+            t.wait('Tasks   '); t.ready(); before = taskfile.read_bytes()
+            t.send('/'); t.wait('/add'); t.wait('/ask'); t.capture('slash-menu-open')
+            opened = '\n'.join(''.join(cell[0] for cell in row) for row in screen(bytes(t.raw), t.cols, t.rows))
+            assert '› /add' in opened and '/ask' in opened, 'Slash did not open selectable command rows immediately'
+            t.send(b'\x1b'); t.pump(.12); t.capture('slash-menu-dismissed')
+            dismissed = '\n'.join(''.join(cell[0] for cell in row) for row in screen(bytes(t.raw), t.cols, t.rows))
+            assert '/' in dismissed and '/add' not in dismissed, 'Escape should hide choices while preserving the slash draft'
+            t.send(b'\x7f'); offset = len(t.raw); t.send('/d'); t.wait('/done', offset); t.wait('/delete', offset); t.capture('slash-menu-filtered')
+            filtered = '\n'.join(''.join(cell[0] for cell in row) for row in screen(bytes(t.raw), t.cols, t.rows))
+            assert '/done' in filtered and '/delete' in filtered and '/add' not in filtered, 'Command choices did not filter by typed prefix'
+            t.send(b'\x1b[B'); t.pump(.2); selected = t.capture('slash-menu-arrow-selected')
+            assert '› /delete' in selected, 'Arrow keys did not move menu selection'
+            offset = len(t.raw); t.resize(42, 14); t.wait('/delete', offset); t.ready(); resized = t.capture('slash-menu-resized')
+            assert '› /delete' in resized, 'Resize lost the draft or menu selection'
+            t.send('\t'); t.pump(.2); t.capture('slash-menu-tab-completed')
+            completed = '\n'.join(''.join(cell[0] for cell in row) for row in screen(bytes(t.raw), t.cols, t.rows))
+            assert '/delete ' in completed and '/done' not in completed and taskfile.read_bytes() == before, 'Tab must fill the highlighted command, hide choices for arguments and avoid execution'
+            t.send(b'\x15'); offset = len(t.raw); t.send('/up'); t.wait('/update', offset); t.wait('/upgrade', offset); ambiguous = t.capture('slash-menu-update-upgrade')
+            assert '/update' in ambiguous and '/upgrade' in ambiguous, 'The shared command table must include all valid update commands'
+            t.send('\t'); t.pump(.2); completed_update = t.capture('slash-menu-update-tab-completed')
+            assert '/update ' in completed_update and taskfile.read_bytes() == before, 'Tab should complete the highlighted /up match without executing it'
+            t.send(b'\x15'); t.send(b'\x1b[200~pasted draft\x1b[201~'); t.pump(.2); pasted = t.capture('slash-menu-paste-remains-draft')
+            assert 'pasted draft' in pasted and taskfile.read_bytes() == before, 'Pasting ordinary text must preserve it as a draft'
+            t.send(b'\x15'); offset = len(t.raw); t.send('/help\r'); t.wait('tiny Markdown tasks', offset); t.ready(); t.capture('slash-menu-enter-exact-command')
+            assert taskfile.read_bytes() == before, 'Enter should still submit a complete typed command'
+            t.send(b'\x03'); t.finish(); assert taskfile.read_bytes() == before
+        finally: t.close(); active.remove(t)
+    case('slash menu opens immediately, dismisses without losing draft, filters and fills safely', slash_commands)
 
     def ai():
         subprocess.run([str(binary), 'init', '--storage', str(storage), '--provider', 'ollama', '--model', 'fixture-local', '--endpoint', f'http://127.0.0.1:{server.server_port}'], env=env, check=True, capture_output=True)
@@ -451,7 +491,7 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
             first = t.capture('storage-recommended-default')
             assert '› 1' in first and '(Recommended)' in first and 'Documents/doin' in first
             t.send('\r'); t.wait('How would you like to organize'); t.ready(); t.send('\r')
-            t.wait('How would you like your AI?'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            t.wait('How would you like your AI?'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
             settings = json.loads((root / 'default-storage' / 'config.json').read_text())
             assert settings['storage'] == str(fakehome / 'Documents' / 'doin')
             assert (folder_log.read_bytes() if folder_log.exists() else b'') == before
@@ -466,7 +506,7 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
             assert 'Select a folder' in cancelled and not (root / 'cancel-storage' / 'config.json').exists()
             t.send('\x1b[B\r'); t.wait('Use this folder'); t.ready(); t.send('Documents\r'); t.pump(.2); t.send('\r')
             t.wait('How would you like to organize'); t.ready(); t.send('\r')
-            t.wait('How would you like your AI?'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            t.wait('How would you like your AI?'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
             assert json.loads((root / 'cancel-storage' / 'config.json').read_text())['storage'] == str(chosen)
             assert (folder_log.read_bytes() if folder_log.exists() else b'') == before
             t.capture('storage-picker-selected-unicode'); t.finish()
@@ -496,7 +536,7 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
             t.send('\x1b[1;3D'); t.pump(.2); t.ready(); t.send('\x1b[1;3C'); t.pump(.2); t.ready()
             t.send('\x1b[D'); t.pump(.2); t.ready(); t.send('2026x\x7f\r'); t.pump(.2); t.ready(); t.send('\x1b[D'); t.pump(.2); t.ready(); t.send('Beta\r'); t.pump(.2); t.ready(); t.send('\r')
             t.wait('How would you like to organize'); t.ready(); t.send('\r')
-            t.wait('How would you like your AI?'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            t.wait('How would you like your AI?'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
             settings = json.loads((root / 'browser-storage' / 'config.json').read_text())
             assert settings['storage'] == str(target.resolve())
             t.finish()
@@ -507,42 +547,62 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
         custom = onboarding_env('onboarding', root / 'onboarded tasks')
         t = start(custom_env=custom, cols=70, rows=28)
         try:
-            t.wait('Select a folder'); t.ready(); onboarding_screen=t.capture('onboarding-bottom-composer'); assert '╭' in onboarding_screen.splitlines()[-4]; storage_choice(t); t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\r'); t.wait('Manual (Recommended) — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
-            assert b'1 \x1b[2m/\x1b[0m Where should your markdown live?' in t.raw
-            assert b'2 \x1b[2m/\x1b[0m How would you like to organize your tasks?' in t.raw
-            assert b'3 \x1b[2m/\x1b[0m How would you like your AI?' in t.raw
+            t.wait('Select a folder'); t.ready(); onboarding_screen=t.capture('onboarding-first-step'); assert '1/3 Where should your markdown live?' in onboarding_screen and '╭' not in onboarding_screen; storage_choice(t); t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\r'); t.wait('ChatGPT'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            assert b'1/3 Where should your markdown live?' in t.raw
+            assert b'2/3 How would you like to organize your tasks?' in t.raw
+            assert b'3/3 How would you like your AI?' in t.raw
             settings = json.loads((root / 'onboarding' / 'config.json').read_text()); assert settings['provider'] == 'manual' and settings['storage'] == str(root / 'onboarded tasks')
             t.capture('onboarding-complete'); t.finish(sig=signal.SIGTERM)
         finally: t.close(); active.remove(t)
-    case('first-run location then model skip continues into composer; SIGTERM restores terminal', onboarding)
+    case('first-run guided setup continues into composer; SIGTERM restores terminal', onboarding)
 
     def onboarding_arrows():
         custom = onboarding_env('arrows-onboarding', root / 'areas-tasks')
-        t = start(custom_env=custom, cols=70, rows=28)
+        t = start(custom_env=custom, cols=80, rows=24)
         try:
             storage_choice(t)
             t.wait('How would you like to organize your tasks?'); t.ready()
-            initial=t.capture('onboarding-organization-recommended'); assert '› 1  Simple (Recommended) — one Markdown list' in initial
+            initial=t.capture('onboarding-organization-recommended'); assert '2/3 How would you like to organize your tasks?' in initial and '› 1  Simple (Recommended) — one Markdown list' in initial and 'Working · input resumes when ready' not in initial and '╭' not in initial
             t.send('\x1b[B\x1b[B\r'); t.wait('Projects (Recommended) — Inbox, Projects, Archive'); t.ready()
-            t.capture('onboarding-template-recommended'); t.send('\x1b[B\r')
-            t.wait('Manual (Recommended) — no model needed'); t.ready()
-            t.send('\x1b[B\x1b[B\x1b[B'); t.pump(.2)
-            fourth=t.capture('onboarding-fourth-ai'); assert '› 4  Continue with ChatGPT' in fourth
-            t.send('\x1b[A\x1b[A\x1b[A\r'); t.wait('Tasks   '); t.ready()
+            nested=t.capture('onboarding-template-recommended'); assert '2/3 Template for your tasks' in nested and 'Back' in nested and 'Working · input resumes when ready' not in nested and '╭' not in nested
+            t.send('\x1b'); t.wait('How would you like to organize your tasks?'); t.ready(); t.capture('onboarding-template-escape-back')
+            t.send('\x1b[B\x1b[B\r'); t.wait('Projects (Recommended) — Inbox, Projects, Archive'); t.ready(); t.send('\x1b[B\x1b[B\r')
+            t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\x1b[B\x1b[B\r'); t.wait('Projects (Recommended) — Inbox, Projects, Archive'); t.ready(); t.send('\x1b[B\r')
+            t.wait('Areas — Personal, Work, Someday'); t.ready()
+            t.wait('How would you like your AI?'); t.ready()
+            short=t.capture('onboarding-ai-shortlist'); assert '3/3 How would you like your AI?' in short and '› 1  ChatGPT' in short and '2  Grok' in short and '3  Local with Ollama' in short and '4  More...' in short and 'Manual' not in short and '╭' not in short
+            t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready()
+            full=t.capture('onboarding-ai-expanded'); assert '› 1  Manual — no model needed' in full and '15  Fireworks AI' in full and '╭' not in full
+            t.send('\r'); t.wait('Tasks   '); t.ready()
             settings=json.loads((root / 'arrows-onboarding' / 'config.json').read_text())
             assert settings['provider']=='manual'
             names={p.parent.name for p in (root / 'areas-tasks').rglob('.doin-folder.json')}
             assert {'Personal','Work','Someday'} <= names
             t.capture('onboarding-areas-persisted'); t.finish()
         finally: t.close(); active.remove(t)
-    case('onboarding arrows choose Areas; top recommendation visible; fourth AI choice reachable without authentication', onboarding_arrows)
+    case('onboarding questions stay visible; template Escape and Back return to organization; expanded provider list includes Manual', onboarding_arrows)
+
+    def onboarding_template_escape_custom():
+        custom = onboarding_env('template-back-custom', root / 'template-back-tasks')
+        t = start(custom_env=custom, cols=80, rows=24)
+        try:
+            storage_choice(t)
+            t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\x1b[B\x1b[B\r'); t.wait('Projects (Recommended) — Inbox, Projects, Archive'); t.ready()
+            t.capture('onboarding-template-before-escape'); t.send('\x1b'); t.wait('How would you like to organize your tasks?'); t.ready()
+            t.send('\x1b[B\r'); t.wait('Folder name [Inbox]'); t.ready(); t.send('Studio\r'); t.wait('First task [Enter to skip]'); t.ready(); t.send('Review the launch checklist\r')
+            t.wait('How would you like your AI?'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            config=json.loads((root / 'template-back-custom' / 'config.json').read_text()); assert config['provider']=='manual' and config['storage']==str(root / 'template-back-tasks' / 'Studio')
+            assert 'Review the launch checklist' in (root / 'template-back-tasks' / 'Studio' / 'tasks.md').read_text()
+            t.capture('onboarding-template-escape-custom-complete'); t.finish()
+        finally: t.close(); active.remove(t)
+    case('template Escape returns to organization so Custom folder and first task can complete', onboarding_template_escape_custom)
 
     def onboarding_resize_cancel():
         custom = onboarding_env('resize-onboarding', root / 'resize-tasks')
         t = start(custom_env=custom, cols=70, rows=28)
         try:
             storage_choice(t)
-            t.wait('Simple (Recommended)'); t.ready(); t.resize(62, 22); t.pump(.3)
+            t.wait('Simple (Recommended)'); t.ready(); t.resize(80, 16); t.pump(.3)
             resized=t.capture('onboarding-resize-recommended'); assert '› 1  Simple (Recommended)' in resized
             assert not (root / 'resize-onboarding' / 'config.json').exists()
             t.finish(sig=signal.SIGINT)
@@ -556,6 +616,7 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
         t = start(custom_env=custom, cols=76, rows=16)
         try:
             t.ready(); t.send('/provider\r'); t.wait('AI provider'); t.ready()
+            t.send('\x1b[B' * 3 + '\r'); t.wait('Manual — no model needed'); t.ready()
             t.send('\x1b[B' * 14); t.pump(.2)
             last = t.capture('provider-menu-last-option-short')
             assert '› 15  Fireworks AI' in last
@@ -577,7 +638,7 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
         t = start(custom_env=custom)
         try:
             storage_choice(t)
-            t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\r'); t.wait('Manual (Recommended) — no model needed'); t.ready(); t.send('\x1b[B\r'); t.wait('API base URL'); t.ready()
+            t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\r'); t.wait('Local with Ollama'); t.ready(); t.send('3\r'); t.wait('API base URL'); t.ready()
             t.send(f'http://127.0.0.1:{server.server_port}\r'); t.wait('fixture-local'); t.ready()
             assert b'\x1b[2J' not in t.raw and b'local-catalog-title' not in t.raw
             t.send('fixture-local\r'); t.wait('Tasks   '); t.ready(); t.capture('local-catalog-sanitized'); t.finish()
@@ -744,12 +805,15 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
     case('NO_COLOR, dumb narrow terminal, and piped CLI output remain plain', plain)
     def network_boundary():
         assert guard_log.read_text()=="blocked\n", "Application attempted external network"
-    case("network guard rejects nonfixture URLs before execution and no application case attempts external access",network_boundary)
+        browser_attempts=[json.loads(line) for line in browser_guard_log.read_text().splitlines()]
+        assert browser_attempts==[{'command':'open','argv':['https://example.invalid']}], "An application case attempted to launch a real browser"
+    case("network and browser guards reject nonfixture destinations; app cases make no unexpected browser attempts",network_boundary)
     for terminal in active: terminal.close()
 server.shutdown(); server.server_close(); thread.join(timeout=5)
 report = {'binary': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'binary_bytes': binary.stat().st_size, 'cases': cases, 'captures': captures, 'requests': requests, 'service_calls': service_calls, 'terminal_restorations': restorations}
 (artifacts / 'results.json').write_text(json.dumps(report, indent=2))
 (artifacts / 'README.md').write_text('# Real PTY evidence\n\nRun `python3 tests/tui_e2e.py --bin zig-out/bin/doin`. SVG files render the screen decoded from each raw ANSI transcript; text files contain the same screen cells. No screenshots are fabricated from layout code. Provider/microphone fixtures test adapters, not real account consent or microphone capture.\n\n' + '\n'.join(f"- [{c['name']}]({c['screen']}) at {c['columns']} columns × {c['rows']} rows." for c in captures) + '\n')
 for c in cases: print(('PASS ' if c['passed'] else 'FAIL ') + c['name'])
+if args.case and not cases: raise SystemExit(f'No E2E case named {args.case!r}')
 print(f'Binary: {binary.stat().st_size} bytes; evidence: {artifacts}')
 raise SystemExit(0 if all(c['passed'] for c in cases) else 1)

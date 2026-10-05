@@ -85,10 +85,10 @@ with tempfile.TemporaryDirectory(prefix='doin-e2e-') as tmp:
         isolated = root / 'onboarding-config'; old = env['DOIN_CONFIG_DIR']; env['DOIN_CONFIG_DIR'] = str(isolated)
         try:
             chosen = root / 'onboarding folder'
-            output = run(stdin=str(chosen) + '\n\ninvalid\n1\n')
+            output = run(stdin=str(chosen) + '\n\ninvalid\n4\n1\n')
             assert output.index('Where should') < output.index('How would you like to organize your tasks?') < output.index('How would you like your AI?')
             assert '1  Simple' in output
-            assert 'Choose a number from 1 to 15' in output
+            assert 'Choose a number from 1 to 4' in output
             settings = json.loads((isolated / 'config.json').read_text())
             assert settings['storage'] == str(chosen.resolve()) and settings['provider'] == 'manual'
             assert settings['library_root'] == str(chosen.resolve())
