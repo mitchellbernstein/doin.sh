@@ -9,6 +9,25 @@ import { build } from 'esbuild';
 const root = new URL('../', import.meta.url);
 const temp = await mkdtemp(join(tmpdir(), 'doin-sync-e2e-'));
 const checks = [];
+const billingFailureCoverage = [
+  'wrong target interval and unauthenticated switch',
+  'amount changes after the preview but before confirmation',
+  'payment pending with existing entitlement and pending target period',
+  'lost response after Stripe accepts an update and exact idempotent retry',
+  'legacy monthly plan reports its actual Stripe price amount',
+  'completed switch confirmation replays applied success without a second mutation',
+  'expired or period-rolled ambiguous switch cannot issue a new Stripe mutation',
+  'untrusted customer portal URL',
+  'period switch while cancellation is pending',
+  'expired quote and no-active-subscription account',
+  'legacy monthly subscription reports the current Stripe price amount',
+  'same-target preview reuses the live quote without another provider preview or database row',
+  'completed quote confirmation replays success without duplicate Stripe mutation',
+  'billing refresh reconciles settled pending quote after browser reload',
+  'expired or period-rolled ambiguous update cannot be replayed as a new Stripe mutation',
+  'unrelated provider pending update is not attributed to the quote',
+  'per-account billing preview limit applies before provider invoice preview',
+];
 const pass = (name) => { checks.push(name); console.log(`PASS ${name}`); };
 let entitlementPrice='price_sync';
 let status = 'incomplete_expired', wrongPrice = false, providerDown = false, complete = false;
@@ -19,6 +38,8 @@ let mailDown = false, cancelAtPeriodEnd = false;
 const cancellations = [];
 const deletedCustomers = new Set();
 const checkouts = new Map();
+const subscriptionsById = new Map(), stripeOperations = new Map(), portalSessions = [];
+let pendingInterval = null, paymentRequired = false, previewDue = 1250, failAfterSwitch = false, portalUrl = null, previewCalls=0;
 let checkoutBody,expireDown=false,failAfterExpire=false;
 const outbound = async (request) => {
   const url = new URL(request.url);
@@ -31,18 +52,45 @@ const outbound = async (request) => {
     mailbox.set(message.to, message);
     return Response.json({messageId:'fixture-message'});
   }
+  if(url.pathname==='/v1/billing_portal/sessions'){
+    const fields=new URLSearchParams(await request.text());
+    portalSessions.push(Object.fromEntries(fields));
+    return Response.json({id:`bps_${portalSessions.length}`,customer:fields.get('customer'),return_url:fields.get('return_url'),url:portalUrl??`https://billing.stripe.com/p/session/test_${portalSessions.length}`});
+  }
   if (url.pathname.startsWith('/v1/subscriptions/') && request.method === 'POST') {
     const fields = new URLSearchParams(await request.text());
-    assert.ok(['true','false'].includes(fields.get('cancel_at_period_end')));
-    cancellations.push(url.pathname);
-    cancelAtPeriodEnd = fields.get('cancel_at_period_end') === 'true';
-    return Response.json({id:url.pathname.split('/').pop(),cancel_at_period_end:cancelAtPeriodEnd});
+    const id=url.pathname.split('/').pop();
+    if(fields.has('cancel_at_period_end')){
+      assert.ok(['true','false'].includes(fields.get('cancel_at_period_end')));
+      cancellations.push(url.pathname);cancelAtPeriodEnd=fields.get('cancel_at_period_end')==='true';
+      const existing=subscriptionsById.get(id);if(existing)existing.cancel_at_period_end=cancelAtPeriodEnd;
+      return Response.json(existing??{id,cancel_at_period_end:cancelAtPeriodEnd});
+    }
+    assert.equal(fields.get('payment_behavior'),'pending_if_incomplete');
+    assert.equal(fields.get('proration_behavior'),'always_invoice');
+    const old=subscriptionsById.get(id);assert.ok(old);
+    const key=request.headers.get('idempotency-key');
+    if(!stripeOperations.has(key)){
+      stripeOperations.set(key,Object.fromEntries(fields));
+      if(paymentRequired)pendingInterval=fields.get('items[0][price]')==='price_year'?'year':'month';
+      else {const id=fields.get('items[0][price]');old.items.data[0].price={id,unit_amount:id==='price_year'?4999:499,currency:'usd'};old.items.data[0].quantity=Number(fields.get('items[0][quantity]'));pendingInterval=null;}
+    }
+    old.pending_update=pendingInterval?{subscription_items:[{price:pendingInterval==='year'?'price_year':'price_month'}]}:null;
+    if(failAfterSwitch){failAfterSwitch=false;return new Response('lost response after Stripe accepted update',{status:503});}
+    return Response.json(structuredClone(old));
   }
   if (url.pathname.startsWith('/v1/subscriptions/') && request.method === 'DELETE') {
     deletedCustomers.add(url.pathname.split('/').pop().replace('sub_',''));
     return Response.json({status:'canceled'});
   }
   if (url.pathname.startsWith('/v1/invoices/')) {
+    if(url.pathname==='/v1/invoices/create_preview'){
+      previewCalls++;
+      const fields=new URLSearchParams(await request.text());
+      assert.ok(fields.get('subscription_details[proration_date]'));
+      assert.equal(fields.get('subscription_details[proration_behavior]'),'always_invoice');
+      return Response.json({currency:'usd',amount_due:previewDue});
+    }
     const customer=url.pathname.split('/').pop().replace('in_','');
     return Response.json({customer,status:'open',hosted_invoice_url:`https://invoice.stripe.com/i/in_${customer}`});
   }
@@ -51,7 +99,7 @@ const outbound = async (request) => {
     if (!customers.has(key)) customers.set(key, `cus_${customers.size + 1}`);
     return Response.json({ id: customers.get(key) });
   }
-  if (url.pathname.startsWith('/v1/prices/')) { const id=url.pathname.split('/').pop(); return Response.json({id,active:true,currency:'usd',unit_amount:id==='price_year'?4999:499,recurring:{interval:id==='price_year'?'year':'month',interval_count:1}}); }
+  if (url.pathname.startsWith('/v1/prices/')) { const id=url.pathname.split('/').pop(); return Response.json({id,active:true,currency:'usd',unit_amount:id==='price_year'?4999:id==='price_legacy'?299:499,recurring:{interval:id==='price_year'?'year':'month',interval_count:1}}); }
   if (url.pathname === '/v1/checkout/sessions') {
     if(request.method==='GET') return Response.json({data:[...checkouts.values()].filter(c=>c.customer===url.searchParams.get('customer') && c.status==='open'),has_more:false});
     checkoutBody = new URLSearchParams(await request.text());
@@ -67,7 +115,18 @@ const outbound = async (request) => {
   }
   if (url.pathname === '/v1/subscriptions') {
     const customer=url.searchParams.get('customer');
-    return Response.json({ data: [{ id: `sub_${customer}`,status:deletedCustomers.has(customer)?'canceled':status,latest_invoice:`in_${customer}`,cancel_at_period_end: cancelAtPeriodEnd, customer, items: { data: [{ price: { id: wrongPrice ? 'price_other' : entitlementPrice }, current_period_end: Math.floor(Date.now()/1000) + 3600 }] } }], has_more: false });
+    const existing=subscriptionsById.get(`sub_${customer}`);
+    const sub=existing??{id:`sub_${customer}`,status:deletedCustomers.has(customer)?'canceled':status,latest_invoice:`in_${customer}`,cancel_at_period_end:cancelAtPeriodEnd,customer,items:{data:[{id:`si_${customer}`,price:{id:wrongPrice?'price_other':entitlementPrice},quantity:1,current_period_end:Math.floor((Date.now()+clockOffset)/1000)+3600}]},pending_update:null};
+    sub.status=deletedCustomers.has(customer)?'canceled':status;
+    subscriptionsById.set(sub.id,sub);
+    return Response.json({ data: [structuredClone(sub)], has_more: false });
+  }
+  if(url.pathname.startsWith('/v1/subscriptions/sub_')&&request.method==='GET'){
+    const id=url.pathname.split('/').pop(),customer=id.replace('sub_','');
+    const existing=subscriptionsById.get(id);
+    if(existing)return Response.json(structuredClone(existing));
+    const sub={id,status:deletedCustomers.has(customer)?'canceled':status,latest_invoice:`in_${customer}`,cancel_at_period_end:cancelAtPeriodEnd,customer,items:{data:[{id:`si_${customer}`,price:{id:wrongPrice?'price_other':entitlementPrice},quantity:1,current_period_end:Math.floor((Date.now()+clockOffset)/1000)+3600}]},pending_update:null};
+    subscriptionsById.set(id,sub);return Response.json(structuredClone(sub));
   }
   throw new Error(`unexpected outbound ${request.method} ${url}`);
 };
@@ -131,6 +190,19 @@ try {
   providerDown=false;
   pass('logged-out plan discovery distinguishes sandbox, live and unavailable without secrets or provider mutations');
   const db = await mf.getD1Database('DB');
+  for (const path of ['/account','/account.js','/account.css']) {
+    const response=await request(path);
+    assert.equal(response.status,200);
+    assert.equal(response.headers.get('cache-control'),'no-store');
+    assert.equal(response.headers.get('referrer-policy'),'no-referrer');
+    assert.equal(response.headers.get('x-content-type-options'),'nosniff');
+    assert.ok(response.headers.get('content-security-policy').includes("script-src 'self'"));
+  }
+  const accountPage=await (await request('/account')).text();
+  assert.ok(accountPage.includes('id="login-form"'));
+  assert.ok(accountPage.includes('id="billing"'));
+  assert.ok(!accountPage.includes('<script>'));
+  pass('web account assets are public, no-store, same-origin and script-isolated');
   await db.exec((await readFile(new URL('migrations/0001.sql', root), 'utf8')).replaceAll('\n', ' '));
   await db.exec((await readFile(new URL('migrations/0002.sql',root),'utf8')).replaceAll('\n',' '));
   await db.exec((await readFile(new URL('migrations/0003.sql',root),'utf8')).replaceAll('\n',' '));
@@ -140,6 +212,7 @@ try {
   await db.exec((await readFile(new URL('migrations/0007.sql',root),'utf8')).replaceAll('\n',' '));
   await db.exec((await readFile(new URL('migrations/0008.sql',root),'utf8')).replaceAll('\n',' '));
   await db.exec((await readFile(new URL('migrations/0009.sql',root),'utf8')).replaceAll('\n',' '));
+  await db.exec((await readFile(new URL('migrations/0010.sql',root),'utf8')).replaceAll('\n',' '));
   const rejected=await start('reject@example.com');
   assert.equal((await poll(rejected,'a'.repeat(64))).status,401);
   assert.equal((await approve(rejected,rejected.confirmation_code,'https://evil.test')).status,403);
@@ -249,6 +322,103 @@ try {
   assert.equal((await request('/v1/document', { method: 'PUT', headers: { ...bearer(a.token), 'content-type': 'application/json' }, body: 'null' })).status, 400);
   pass('two-device CAS race, lossless conflict, retry idempotence, account isolation and size limit');
 
+  const aliceSub={id:'sub_cus_1',status:'active',latest_invoice:'in_cus_1',cancel_at_period_end:false,customer:'cus_1',pending_update:null,items:{data:[{id:'si_cus_1',price:{id:'price_month'},quantity:1,current_period_end:Math.floor(Date.now()/1000)+86400}]}};
+  subscriptionsById.set(aliceSub.id,aliceSub);entitlementPrice='price_month';status='active';cancelAtPeriodEnd=false;
+  const monthly=await json(await request('/v1/billing',{headers:bearer(alice)}));
+  assert.deepEqual({interval:monthly.interval,amount:monthly.amount,currency:monthly.currency,pending_update:monthly.pending_update,pending_interval:monthly.pending_interval},{interval:'month',amount:499,currency:'usd',pending_update:false,pending_interval:null});
+  const originalMonthlyPrice=aliceSub.items.data[0].price.id;
+  await request('/__e2e_plan_config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({STRIPE_PRICE_ID:'price_legacy',STRIPE_MONTHLY_PRICE_ID:'',STRIPE_YEARLY_PRICE_ID:'price_year'})});
+  aliceSub.items.data[0].price={id:'price_legacy',unit_amount:299,currency:'usd'};
+  const legacyBilling=await json(await request('/v1/billing',{headers:bearer(alice)}));
+  assert.equal(legacyBilling.interval,'month');assert.equal(legacyBilling.amount,299,'legacy monthly subscriber sees actual current recurring price, not new monthly price');
+  await request('/__e2e_plan_config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({STRIPE_PRICE_ID:'price_sync',STRIPE_MONTHLY_PRICE_ID:'price_month',STRIPE_YEARLY_PRICE_ID:'price_year'})});
+  aliceSub.items.data[0].price={id:originalMonthlyPrice,unit_amount:499,currency:'usd'};
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({interval:'year'})})).status,401);
+  const bobCustomer=(await db.prepare('SELECT customer_id FROM accounts WHERE email=?').bind('bob@example.com').first()).customer_id;
+  await db.prepare('UPDATE accounts SET customer_id=NULL WHERE email=?').bind('bob@example.com').run();
+  const unpaidBilling=await json(await request('/v1/billing',{headers:bearer(bob)}));assert.equal(unpaidBilling.active,false);assert.equal(unpaidBilling.interval,null);assert.equal(unpaidBilling.amount,null);
+  await db.prepare('UPDATE accounts SET customer_id=? WHERE email=?').bind(bobCustomer,'bob@example.com').run();
+  const portal=await json(await request('/v1/billing/portal',{method:'POST',headers:bearer(alice)}));
+  assert.equal(portal.url,'https://billing.stripe.com/p/session/test_1');
+  assert.equal(portalSessions[0].customer,'cus_1');assert.equal(new URL(portalSessions[0].return_url).origin,'https://sync.doin.sh');
+  portalUrl='https://evil.example/steal';
+  assert.equal((await request('/v1/billing/portal',{method:'POST',headers:bearer(alice)})).status,503);
+  portalUrl=null;
+  previewDue=1250;
+  const annualPreview=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year'})}));
+  assert.equal(annualPreview.confirmation_required,true);assert.equal(annualPreview.amount_due,1250);assert.ok(annualPreview.quote_id);assert.ok(annualPreview.expires_at>Math.floor(Date.now()/1000));
+  const quoteRowsBeforeReuse=(await db.prepare('SELECT count(*) AS n FROM billing_change_quotes WHERE account_id=?').bind(a.account.id).first()).n,previewCallsBeforeReuse=previewCalls;
+  const reusedAnnualPreview=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year'})}));
+  assert.equal(reusedAnnualPreview.quote_id,annualPreview.quote_id,'repeated target preview reuses the live matching quote');
+  assert.equal(previewCalls,previewCallsBeforeReuse,'reused preview does not call Stripe again');
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM billing_change_quotes WHERE account_id=?').bind(a.account.id).first()).n,quoteRowsBeforeReuse,'reused preview does not grow stored quote rows');
+  const bobCustomerForChange=(await db.prepare('SELECT customer_id FROM accounts WHERE email=?').bind('bob@example.com').first()).customer_id;
+  await db.prepare('UPDATE accounts SET customer_id=NULL WHERE email=?').bind('bob@example.com').run();
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{...bearer(bob),'content-type':'application/json'},body:JSON.stringify({interval:'year'})})).status,409);
+  await db.prepare('UPDATE accounts SET customer_id=? WHERE email=?').bind(bobCustomerForChange,'bob@example.com').run();
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'week'})})).status,400);
+  previewDue=1750;
+  const refreshedQuote=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year',quote_id:annualPreview.quote_id,confirm_amount:annualPreview.amount_due})}));
+  assert.equal(refreshedQuote.confirmation_required,true);assert.equal(refreshedQuote.amount_due,1750,'changed proration must be requoted before mutation');
+  assert.equal((await json(await request('/v1/billing',{headers:bearer(alice)}))).interval,'month','stale quote cannot change the subscription');
+  paymentRequired=true;
+  const pendingResult=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year',quote_id:refreshedQuote.quote_id,confirm_amount:1750})}));
+  assert.deepEqual({changed:pendingResult.changed,payment_pending:pendingResult.payment_pending,interval:pendingResult.interval},{changed:false,payment_pending:true,interval:'month'});
+  const pendingBilling=await json(await request('/v1/billing',{headers:bearer(alice)}));
+  assert.equal(pendingBilling.interval,'month');assert.equal(pendingBilling.pending_update,true);assert.equal(pendingBilling.pending_interval,'year');
+  assert.equal((await request('/v1/document',{headers:bearer(alice)})).status,200,'pending payment cannot switch the active entitlement');
+  const pendingRecovery=await json(await request('/v1/billing/recover',{method:'POST',headers:bearer(alice)}));assert.equal(pendingRecovery.url,'https://invoice.stripe.com/i/in_cus_1','active pending update still exposes its open recovery invoice');
+  const actualPendingTarget=aliceSub.pending_update.subscription_items[0].price;
+  aliceSub.pending_update.subscription_items[0].price='price_month';
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year',quote_id:refreshedQuote.quote_id,confirm_amount:1750})})).status,409,'unrelated pending provider update cannot be attributed to this quote');
+  aliceSub.pending_update.subscription_items[0].price=actualPendingTarget;
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'month'})})).status,409,'pending provider update must be resolved before another switch');
+  paymentRequired=false;aliceSub.items.data[0].price={id:'price_year',unit_amount:4999,currency:'usd'};aliceSub.pending_update=null;entitlementPrice='price_year';
+  const appliedAnnual=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year',quote_id:refreshedQuote.quote_id,confirm_amount:1750})}));
+  assert.deepEqual({changed:appliedAnnual.changed,payment_pending:appliedAnnual.payment_pending,interval:appliedAnnual.interval},{changed:true,payment_pending:false,interval:'year'});
+  const operationsAfterAnnual=stripeOperations.size;
+  const repeatedAnnual=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year',quote_id:refreshedQuote.quote_id,confirm_amount:1750})}));
+  assert.deepEqual({changed:repeatedAnnual.changed,payment_pending:repeatedAnnual.payment_pending,interval:repeatedAnnual.interval},{changed:true,payment_pending:false,interval:'year'},'completed quote retry replays the applied result');
+  assert.equal(stripeOperations.size,operationsAfterAnnual,'completed confirmation retry must not mutate Stripe again');
+  const annualBilling=await json(await request('/v1/billing',{headers:bearer(alice)}));
+  assert.equal(annualBilling.interval,'year');assert.equal(annualBilling.amount,4999);assert.equal(annualBilling.pending_interval,null);
+  previewDue=0;
+  const monthlyPreview=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'month'})}));
+  assert.equal(monthlyPreview.amount_due,0,'zero amount must remain a valid explicit confirmation');
+  failAfterSwitch=true;
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'month',quote_id:monthlyPreview.quote_id,confirm_amount:0})})).status,503,'network loss after accepted Stripe mutation is ambiguous');
+  const retriedSwitch=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'month',quote_id:monthlyPreview.quote_id,confirm_amount:0})}));
+  assert.equal(retriedSwitch.interval,'month');assert.equal(retriedSwitch.payment_pending,false);assert.equal(stripeOperations.size,2,'ambiguous retry must reuse the persisted operation identity');
+  const switchedBack=await json(await request('/v1/billing',{headers:bearer(alice)}));assert.equal(switchedBack.interval,'month');assert.equal(switchedBack.amount,499);
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'month'})})).status,200,'same period is a no-op');
+  const expiresQuote=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year'})}));
+  await db.prepare("UPDATE billing_change_quotes SET expires_at=0,state='applying' WHERE quote_id=?").bind(expiresQuote.quote_id).run();
+  const periodBeforeAmbiguousRetry=aliceSub.items.data[0].current_period_end;
+  aliceSub.items.data[0].current_period_end=Math.floor((Date.now()+clockOffset)/1000)-1;
+  const operationsBeforeAmbiguousRetry=stripeOperations.size;
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year',quote_id:expiresQuote.quote_id,confirm_amount:expiresQuote.amount_due})})).status,409,'expired uncertain quote cannot mutate after the subscription period rolls');
+  assert.equal(stripeOperations.size,operationsBeforeAmbiguousRetry,'stale ambiguous quote cannot send a fresh Stripe update');
+  aliceSub.items.data[0].current_period_end=periodBeforeAmbiguousRetry;
+  assert.equal((await json(await request('/v1/billing',{headers:bearer(alice)}))).interval,'month');
+  // A recovered invoice can settle without the browser retaining its quote ID.
+  previewDue=750;
+  const reloadQuote=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year'})}));
+  paymentRequired=true;
+  await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year',quote_id:reloadQuote.quote_id,confirm_amount:reloadQuote.amount_due})}));
+  paymentRequired=false;aliceSub.items.data[0].price.id='price_year';aliceSub.items.data[0].price.unit_amount=4999;aliceSub.pending_update=null;entitlementPrice='price_year';
+  const afterRecoveredPayment=await json(await request('/v1/billing',{headers:bearer(alice)}));
+  assert.equal(afterRecoveredPayment.interval,'year');assert.equal(afterRecoveredPayment.pending_update,false,'billing refresh reconciles invoice payment after browser reload');
+  const newReversePreview=await json(await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'month'})}));
+  assert.equal(newReversePreview.confirmation_required,true,'reconciled completed quote does not block a later period switch without its original quote id');
+  await db.prepare("UPDATE billing_change_quotes SET state='failed' WHERE quote_id=?").bind(newReversePreview.quote_id).run();
+  const billingHour=Math.floor((Date.now()+clockOffset)/3600000),billingLimitKey=`billing:${a.account.id}:${billingHour}`;
+  await db.prepare('INSERT INTO rate_limits(key,hits,expires_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET hits=excluded.hits,expires_at=excluded.expires_at').bind(billingLimitKey,10,(billingHour+2)*3600).run();
+  const previewsBeforeLimit=previewCalls;
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'month'})})).status,429,'account-scoped limit blocks excess distinct billing previews');
+  assert.equal(previewCalls,previewsBeforeLimit,'rate-limited request cannot invoke Stripe preview');
+  aliceSub.items.data[0].price={id:'price_month',unit_amount:499,currency:'usd'};entitlementPrice='price_month';
+  pass('explicit monthly/yearly switch quotes bind to proration, pending payment keeps current entitlement, retries are idempotent and portal URLs are validated');
+
   const cancellation=await json(await request('/v1/billing/cancel',{method:'POST',headers:bearer(alice)}));
   assert.equal(cancellation.cancel_at_period_end,true);
   assert.deepEqual(cancellations,['/v1/subscriptions/sub_cus_1']);
@@ -258,6 +428,7 @@ try {
   assert.equal((await json(await request('/v1/billing/resume',{method:'POST',headers:bearer(alice)}))).cancel_at_period_end,false);
   assert.equal((await json(await request('/v1/billing',{headers:bearer(alice)}))).cancel_at_period_end,false);
   assert.equal((await json(await request('/v1/billing/cancel',{method:'POST',headers:bearer(alice)}))).cancel_at_period_end,true);
+  assert.equal((await request('/v1/billing/change',{method:'POST',headers:{...bearer(alice),'content-type':'application/json'},body:JSON.stringify({interval:'year'})})).status,409,'require an explicit resume before changing periods');
   assert.equal((await request('/v1/document',{headers:bearer(alice)})).status,200);
   status = 'canceled';
   assert.equal((await request('/v1/document', { headers: bearer(a.token) })).status, 402);
@@ -265,8 +436,10 @@ try {
   assert.equal(exported.status, 200);
   assert.equal((await exported.json()).content, cloud.content);
   status = 'active'; wrongPrice = true;
+  const aliceSubscription = subscriptionsById.get('sub_cus_1');
+  aliceSubscription.items.data[0].price.id = 'price_other';
   assert.equal((await request('/v1/document', { headers: bearer(a.token) })).status, 402);
-  wrongPrice = false; providerDown = true;
+  wrongPrice = false; aliceSubscription.items.data[0].price.id = 'price_month'; providerDown = true;
   assert.equal((await put(a.token, 2, 'do not save')).status, 503);
   providerDown = false;
   assert.equal((await json(await request('/v1/document', { headers: bearer(a.token) }))).content, cloud.content);
@@ -324,6 +497,6 @@ try {
 } finally {
   await mf.dispose();
   await mkdir(new URL('artifacts/', root), { recursive: true });
-  await writeFile(new URL(`artifacts/${process.env.TEST_ARTIFACT || 'e2e.json'}`, root), JSON.stringify({ command: 'cd cloud && npm ci && npm test', date: new Date().toISOString(), node: process.version, complete, checks }, null, 2));
+  await writeFile(new URL(`artifacts/${process.env.TEST_ARTIFACT || 'e2e.json'}`, root), JSON.stringify({ command: 'cd cloud && node tests/e2e.mjs', date: new Date().toISOString(), node: process.version, complete, checks, billingFailureCoverage }, null, 2));
   await rm(temp, { recursive: true, force: true });
 }

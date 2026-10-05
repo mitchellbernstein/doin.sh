@@ -7,11 +7,24 @@ package/
 dist/
 __pycache__/
 .wrangler/
+cloud/.dev.vars
+cloud/.dev.vars.*
 
 cloud/.wrangler.personal.jsonc
 cloud/.wrangler.commercial.jsonc
+
+ios/Artifacts/
+ios/Doin.xcodeproj/xcuserdata/
+macos/Artifacts/
+macos/Build/
+macos/DoinMac.xcodeproj/xcuserdata/
 
 # Apple app source is maintained in the private doin.sh-gui repository.
 /ios/
 /macos/
 /script/
+
+# Ignore local links to the private Apple source repository.
+/ios
+/macos
+/script

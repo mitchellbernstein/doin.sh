@@ -8,6 +8,7 @@ const providers = @import("providers.zig");
 const provider_auth = @import("provider_auth.zig");
 const copilot = @import("copilot.zig");
 const terminal = @import("terminal.zig");
+const theme = @import("theme.zig");
 const directory_picker = @import("directory_picker.zig");
 const uninstall = @import("uninstall.zig");
 const updater = @import("updater.zig");
@@ -24,6 +25,7 @@ const mcp_client = @import("mcp_client.zig");
 var session_editor: ?terminal.Editor = null;
 var job_config_dir: ?[]const u8 = null;
 var library_root_in_flight: ?[]const u8 = null;
+var active_theme_accent: ?[]const u8 = null;
 const app = @import("build_options").app_name;
 var A: std.mem.Allocator = std.heap.page_allocator;
 const limit = 1024 * 1024;
@@ -119,15 +121,182 @@ fn credentialAtomic(path: []const u8, contents: []const u8) !void {
 fn json(value: anytype) ![]const u8 {
     return std.json.Stringify.valueAlloc(A, value, .{});
 }
+fn applyTheme(accent_hex: ?[]const u8) void {
+    active_theme_accent = accent_hex;
+    terminal.setTheme(accent_hex);
+}
+fn saveThemePreferences(config_dir: []const u8, endpoint: []const u8, preferences: sync.ThemePreferences, pending: bool) !void {
+    try theme.saveAccount(A, config_dir, endpoint, .{
+        .account_id = preferences.account_id,
+        .endpoint_hash = preferences.endpoint_hash,
+        .token_hash = preferences.token_hash,
+        .accent = preferences.accent,
+        .revision = preferences.revision,
+        .pending = pending,
+    });
+}
+fn themeStartup() !void {
+    const config_dir = try dir();
+    const local_accent = theme.loadLocal(A, config_dir) catch null;
+    applyTheme(local_accent);
+    const credential = sync.themeCredential(A, config_dir) catch |err| {
+        if (err == error.SyncEndpointMismatch) applyTheme(null);
+        return;
+    };
+    // A signed-in identity never inherits the anonymous device accent.
+    applyTheme(null);
+    const cached = theme.findOfflineAccount(A, config_dir, credential.endpoint, credential.token_hash) catch null;
+    if (cached) |entry| applyTheme(entry.accent);
+    const pending = theme.loadPending(A, config_dir, credential.endpoint, credential.token_hash) catch null;
+    if (pending) |queued| applyTheme(queued.accent);
+    const preferences = sync.getThemePreferences(A, config_dir, 350) catch return;
+    if (pending) |queued| {
+        const pushed = sync.setThemePreferences(A, config_dir, queued.accent, if (cached) |entry| entry.revision else null, 350) catch return;
+        try saveThemePreferences(config_dir, credential.endpoint, pushed, false);
+        try theme.deletePending(A, config_dir, credential.endpoint, credential.token_hash);
+        applyTheme(pushed.accent);
+        return;
+    }
+    if (cached) |entry| if (entry.pending) {
+        const pushed = sync.setThemePreferences(A, config_dir, entry.accent, entry.revision, 350) catch return;
+        try saveThemePreferences(config_dir, credential.endpoint, pushed, false);
+        applyTheme(pushed.accent);
+        return;
+    };
+    try saveThemePreferences(config_dir, credential.endpoint, preferences, false);
+    applyTheme(preferences.accent);
+}
+fn showTheme() !void {
+    try terminal.heading(A, "Theme");
+    try terminal.systemLine(A, "  Accent ", active_theme_accent orelse "Default neutral");
+    try terminal.systemLine(A, "  Change  ", "/theme default or /theme #RRGGBB");
+    try terminal.systemLine(A, "  Sync    ", "/theme sync");
+}
+fn themeCommand(args: []const []const u8) !void {
+    if (args.len == 0) return showTheme();
+    if (args.len != 1) return error.InvalidThemeArguments;
+    if (std.mem.eql(u8, args[0], "sync")) {
+        const config_dir = try dir();
+        const credential = try sync.themeCredential(A, config_dir);
+        if (try theme.loadPending(A, config_dir, credential.endpoint, credential.token_hash)) |queued| {
+            const base = theme.findOfflineAccount(A, config_dir, credential.endpoint, credential.token_hash) catch null;
+            const preferences = try sync.setThemePreferences(A, config_dir, queued.accent, if (base) |entry| entry.revision else null, 10000);
+            try saveThemePreferences(config_dir, credential.endpoint, preferences, false);
+            try theme.deletePending(A, config_dir, credential.endpoint, credential.token_hash);
+            applyTheme(preferences.accent);
+            return terminal.systemLine(A, "  ", "Theme synced to this account.");
+        }
+        const preferences = try sync.getThemePreferences(A, config_dir, 10000);
+        try saveThemePreferences(config_dir, credential.endpoint, preferences, false);
+        applyTheme(preferences.accent);
+        return terminal.systemLine(A, "  ", "Theme synced from this account.");
+    }
+    const desired: ?[]const u8 = if (std.mem.eql(u8, args[0], "default")) null else try theme.canonical(A, args[0]);
+    applyTheme(desired);
+    const config_dir = try dir();
+    const credential = sync.themeCredential(A, config_dir) catch |err| switch (err) {
+        error.SyncLoginRequired => {
+            try theme.saveLocal(A, config_dir, desired);
+            return terminal.systemLine(A, "  ", if (desired) |value| try std.fmt.allocPrint(A, "Local terminal accent set to {s}.", .{value}) else "Local terminal accent reset to default.");
+        },
+        else => return err,
+    };
+    const cached = theme.findOfflineAccount(A, config_dir, credential.endpoint, credential.token_hash) catch null;
+    try theme.savePending(A, config_dir, credential.endpoint, credential.token_hash, desired);
+    const preferences = sync.setThemePreferences(A, config_dir, desired, if (cached) |entry| entry.revision else null, 5000) catch |err| {
+        if (cached) |entry| try theme.saveAccount(A, config_dir, credential.endpoint, .{ .account_id = entry.account_id, .endpoint_hash = entry.endpoint_hash, .token_hash = entry.token_hash, .accent = desired, .revision = entry.revision, .pending = true });
+        try terminal.systemLine(A, "  ", "Theme applied here; account sync is pending. Run /theme sync when online.");
+        if (err == error.InputClosed) return err;
+        return;
+    };
+    try saveThemePreferences(config_dir, credential.endpoint, preferences, false);
+    try theme.deletePending(A, config_dir, credential.endpoint, credential.token_hash);
+    applyTheme(preferences.accent);
+    try terminal.systemLine(A, "  ", if (preferences.accent) |value| try std.fmt.allocPrint(A, "Account accent set to {s}.", .{value}) else "Account accent reset to default.");
+}
+const onboarding_accents = [_]terminal.ModelOption{
+    .{ .value = "default", .label = "Default neutral" },
+    .{ .value = "#007AFF", .label = "Blueberry" },
+    .{ .value = "#AF52DE", .label = "Grape Soda" },
+    .{ .value = "#34C759", .label = "Matcha" },
+    .{ .value = "#FF9500", .label = "Tangerine" },
+    .{ .value = "#FF2D55", .label = "Bubblegum" },
+    .{ .value = "custom", .label = "Custom hex…" },
+};
+fn previewOnboardingAccent(_: ?*anyopaque, value: []const u8) void {
+    if (std.mem.eql(u8, value, "default")) applyTheme(null) else if (!std.mem.eql(u8, value, "custom")) applyTheme(value);
+}
+fn onboardingAccentInitial() []const u8 {
+    const current = active_theme_accent orelse return "default";
+    for (onboarding_accents) |option| if (std.mem.eql(u8, option.value, current)) return option.value;
+    return "custom";
+}
+fn onboardingAccent(c: *Config) !void {
+    while (true) {
+        const previous = active_theme_accent;
+        const result = terminal.modelPick(A, .{
+            .name = "3/4 Choose your accent color",
+            .prefix = "",
+            .suffix = "",
+            .placeholder = "Choose an accent",
+            .initial = onboardingAccentInitial(),
+            .options = &onboarding_accents,
+            .explanation = "Preview follows your selection. Enter keeps it; Esc returns to organization.",
+            .selection_only = true,
+            .escape_back = true,
+            .on_selection = previewOnboardingAccent,
+        }) catch |err| {
+            applyTheme(previous);
+            if (err == error.PickerResized) continue;
+            return err;
+        };
+        if (result.back) {
+            applyTheme(previous);
+            try organization(c);
+            continue;
+        }
+        var chosen: ?[]const u8 = if (std.mem.eql(u8, result.value, "default")) null else result.value;
+        if (std.mem.eql(u8, result.value, "custom")) {
+            applyTheme(previous);
+            const entered = std.mem.trim(u8, try prompt(A, "Accent #RRGGBB [Enter to keep current]:"), " \r\n\t");
+            if (entered.len == 0) {
+                chosen = previous;
+            } else chosen = theme.canonical(A, entered) catch |err| {
+                try terminal.systemLine(A, "  ", "Use exactly six hexadecimal digits, for example #2A78C8.");
+                if (err != error.InvalidThemeAccent) return err;
+                continue;
+            };
+        }
+        applyTheme(chosen);
+        const credential = sync.themeCredential(A, try dir()) catch |err| switch (err) {
+            error.SyncLoginRequired => null,
+            else => return err,
+        };
+        if (credential != null) {
+            const argument = chosen orelse "default";
+            try themeCommand(&.{argument});
+        } else try theme.saveLocal(A, try dir(), chosen);
+        return;
+    }
+}
+fn themeSettings() !void {
+    try themeStartup();
+    try terminal.heading(A, "Theme");
+    try terminal.systemLine(A, "  Accent ", active_theme_accent orelse "Default neutral");
+    try out("\n  1  Default neutral accent\n  2  Custom hex accent\n\n");
+    const choice = try prompt(A, "Accent [1 default, 2 custom, Enter to return]:");
+    if (choice.len == 0) return;
+    if (std.mem.eql(u8, choice, "1") or std.ascii.eqlIgnoreCase(choice, "default")) return themeCommand(&.{"default"});
+    if (std.mem.eql(u8, choice, "2") or std.ascii.eqlIgnoreCase(choice, "custom")) {
+        const value = std.mem.trim(u8, try prompt(A, "Accent #RRGGBB:"), " \r\n\t");
+        if (value.len == 0) return;
+        return themeCommand(&.{value});
+    }
+    return error.InvalidThemeArguments;
+}
 fn load() !Config {
     const bytes = try read(try join(&.{ try dir(), "config.json" }));
     return (try std.json.parseFromSlice(Config, A, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })).value;
-}
-fn uninstallChoice() ![]const u8 {
-    return setupChoice("What should happen to your task folders?", &.{
-        .{ .value = "keep", .label = "Keep task folders (Recommended)", .detail = "Remove only doin and its app settings" },
-        .{ .value = "delete", .label = "Delete task folders and ALL their contents", .detail = "Permanently remove every file in the listed folders" },
-    });
 }
 fn uninstallCommand(args: []const []const u8) !void {
     if (args.len != 0) return error.InvalidUninstallArguments;
@@ -152,7 +321,7 @@ fn uninstallCommand(args: []const []const u8) !void {
         std.fs.cwd().access(config_path, .{}) catch |err| break :blk err == error.FileNotFound;
         break :blk false;
     };
-    uninstall.run(A, .{ .config_dir = config_dir, .executable = try std.fs.selfExePathAlloc(A), .task_roots = roots.items, .jobs = jobs.items, .config_readable = config != null or missing }, .{ .prompt = prompt, .choose = uninstallChoice }) catch |err| {
+    uninstall.run(A, .{ .config_dir = config_dir, .executable = try std.fs.selfExePathAlloc(A), .task_roots = roots.items, .jobs = jobs.items, .config_readable = config != null or missing }, .{ .prompt = prompt }) catch |err| {
         if (err == error.InputClosed or err == error.EndOfStream or err == error.PickerCancelled or err == error.Interrupted) return out("Cancelled. Nothing removed.\n");
         return err;
     };
@@ -244,6 +413,14 @@ fn models(provider: []const u8, base: []const u8) !void {
     const choices = try modelChoices(.{ .storage = "/", .provider = provider, .endpoint = base });
     for (choices) |option| try terminal.line(A, "  ", option.value);
 }
+fn chatgptModelRank(model: []const u8) u8 {
+    if (std.mem.eql(u8, model, "gpt-6-luna")) return 0;
+    if (std.mem.endsWith(u8, model, "-luna")) return 1;
+    if (std.mem.endsWith(u8, model, "-terra")) return 2;
+    if (std.mem.endsWith(u8, model, "-sol")) return 3;
+    if (std.mem.endsWith(u8, model, "-astra")) return 4;
+    return 5;
+}
 const ModelCapabilities = struct {
     windows: []const terminal.ModelOption,
     efforts: []const terminal.ModelOption,
@@ -274,6 +451,17 @@ fn modelChoices(c: Config) ![]const terminal.ModelOption {
         try options.append(A, .{ .value = slug, .label = try terminal.clean(A, display, false), .detail = slug });
     }
     if (options.items.len == 0) return error.NoModelChoices;
+    if (std.mem.eql(u8, c.provider, "chatgpt")) {
+        for (1..options.items.len) |i| {
+            const option = options.items[i];
+            const rank = chatgptModelRank(option.value);
+            var j = i;
+            while (j > 0 and chatgptModelRank(options.items[j - 1].value) > rank) : (j -= 1) {
+                options.items[j] = options.items[j - 1];
+            }
+            options.items[j] = option;
+        }
+    }
     return options.toOwnedSlice(A);
 }
 fn modelCapabilities(c: Config, model: []const u8) !ModelCapabilities {
@@ -373,12 +561,14 @@ fn modelPicker(c: Config) !void {
 }
 
 fn setupQuestion(number: usize, text: []const u8) !void {
+    if (terminal.rich()) return;
     try say("\n{d} {s}/{s} {s}\n", .{ number, if (terminal.rich()) "\x1b[2m" else "", if (terminal.rich()) "\x1b[0m" else "", text });
 }
-fn setupChoice(label: []const u8, options: []const terminal.ModelOption) ![]const u8 {
+const setup_back = "__setup_back";
+fn setupChoiceWithBack(label: []const u8, options: []const terminal.ModelOption, escape_back: bool) ![]const u8 {
     if (terminal.rich()) {
         while (true) {
-            const result = terminal.modelPick(A, .{ .name = label, .prefix = "", .suffix = "", .placeholder = "Choose an option", .options = options, .explanation = "", .selection_only = true }) catch |err| {
+            const result = terminal.modelPick(A, .{ .name = label, .prefix = "", .suffix = "", .placeholder = "Choose an option", .options = options, .explanation = "", .selection_only = true, .escape_back = escape_back }) catch |err| {
                 if (err == error.PickerResized) continue;
                 if (err == error.PickerCancelled) return error.PickerCancelled;
                 if (err == error.InvalidModelChoice) {
@@ -387,10 +577,19 @@ fn setupChoice(label: []const u8, options: []const terminal.ModelOption) ![]cons
                 }
                 return err;
             };
+            if (result.back) {
+                if (escape_back) return setup_back;
+                return error.PickerCancelled;
+            }
             return result.value;
         }
     }
-    return prompt(A, try std.fmt.allocPrint(A, "{s} [1]: ", .{label}));
+    const choice = try prompt(A, try std.fmt.allocPrint(A, "{s} [1]: ", .{label}));
+    if (escape_back and std.mem.indexOfScalar(u8, choice, 27) != null) return setup_back;
+    return choice;
+}
+fn setupChoice(label: []const u8, options: []const terminal.ModelOption) ![]const u8 {
+    return setupChoiceWithBack(label, options, false);
 }
 fn storageChoice() ![]const u8 {
     const home = env("HOME") orelse return error.HomeMissing;
@@ -399,7 +598,7 @@ fn storageChoice() ![]const u8 {
     const start = home;
     while (true) {
         if (!terminal.rich()) try say("  1  ~/Documents/{s} (Recommended)\n  2  Select a folder…\n", .{app});
-        const choice = try setupChoice("Folder", &.{
+        const choice = try setupChoice("1/4 Where should your markdown live?", &.{
             .{ .value = "default", .label = try std.fmt.allocPrint(A, "~/Documents/{s} (Recommended)", .{app}), .detail = default },
             .{ .value = "select", .label = "Select a folder…", .detail = "Browse your computer" },
         });
@@ -422,12 +621,14 @@ fn configureProvider(c: *Config, id: []const u8, args: []const []const u8, inter
     const spec = providers.lookup(id) orelse return error.UnknownProvider;
     var next = c.*;
     try rememberProfile(&next);
+    var has_profile = false;
     next.provider = spec.id;
     next.model = spec.default_model;
     next.endpoint = spec.endpoint;
     next.context_tokens = null;
     next.effort = null;
     for (next.provider_profiles) |profile| if (std.mem.eql(u8, profile.provider, id)) {
+        has_profile = true;
         next.model = profile.model;
         next.endpoint = profile.endpoint;
         next.context_tokens = profile.context_tokens;
@@ -449,12 +650,75 @@ fn configureProvider(c: *Config, id: []const u8, args: []const []const u8, inter
         const value = try prompt(A, try std.fmt.allocPrint(A, "API base URL [{s}]: ", .{next.endpoint}));
         if (value.len > 0) next.endpoint = value;
     }
-    if (interactive and (spec.transport == .ollama or (spec.auth != .none and spec.auth != .copilot))) {
-        models(id, next.endpoint) catch try out("Could not list provider models. Enter a supported model name.\n");
-    }
     if (interactive and !std.mem.eql(u8, id, "manual")) {
-        const value = try prompt(A, try std.fmt.allocPrint(A, "Model [{s}]: ", .{next.model}));
-        if (value.len > 0) next.model = value;
+        const custom_model = "__doin_custom_model__";
+        var choices: []const terminal.ModelOption = &.{};
+        const catalog_used = std.mem.eql(u8, id, "chatgpt") or spec.transport == .ollama or (spec.auth != .none and spec.auth != .copilot);
+        if (catalog_used) {
+            choices = modelChoices(next) catch blk: {
+                try out("Could not list provider models. Enter a supported model name.\n");
+                break :blk &.{};
+            };
+        }
+        if (terminal.rich()) {
+            var options: std.ArrayList(terminal.ModelOption) = .empty;
+            try options.appendSlice(A, choices);
+            try options.append(A, .{ .value = custom_model, .label = "Enter a model name…", .detail = "Use a provider-supported model name" });
+            const starting_model = next.model;
+
+            // A first ChatGPT connection starts at the weakest advertised family.
+            // Existing profiles and explicit command-line choices keep their value.
+            if (std.mem.eql(u8, id, "chatgpt") and !has_profile and flag(args, "--model") == null) {
+                var preferred: ?[]const u8 = null;
+                for (choices) |option| {
+                    if (chatgptModelRank(option.value) <= 3) {
+                        preferred = option.value;
+                        break;
+                    }
+                }
+                next.model = preferred orelse custom_model;
+            } else if (choices.len > 0 and !selectedSupported(choices, next.model)) {
+                next.model = custom_model;
+            }
+
+            var selection: ?terminal.ModelChoice = null;
+            while (selection == null) {
+                selection = terminal.modelPick(A, .{
+                    .name = "Choose a model",
+                    .prefix = "",
+                    .suffix = "",
+                    .placeholder = "Select a listed model or enter a custom name",
+                    .initial = next.model,
+                    .options = options.items,
+                    .explanation = "Choose a supported provider model. Escape returns to provider selection.",
+                    .selection_only = true,
+                    .escape_back = true,
+                }) catch |err| {
+                    if (err == error.PickerResized) continue;
+                    return err;
+                };
+            }
+            const selected = selection.?;
+            if (selected.back) return error.ProviderModelBack;
+            if (std.mem.eql(u8, selected.value, custom_model)) {
+                const value = try prompt(A, try std.fmt.allocPrint(A, "Model [{s}]: ", .{starting_model}));
+                if (value.len > 0) next.model = value else if (starting_model.len > 0) next.model = starting_model else return error.ProviderModelBack;
+            } else next.model = selected.value;
+        } else {
+            if (catalog_used) {
+                for (choices) |option| try terminal.line(A, "  ", option.value);
+            }
+            if (std.mem.eql(u8, id, "chatgpt") and !has_profile and flag(args, "--model") == null) {
+                for (choices) |option| {
+                    if (chatgptModelRank(option.value) <= 3) {
+                        next.model = option.value;
+                        break;
+                    }
+                }
+            }
+            const value = try prompt(A, try std.fmt.allocPrint(A, "Model [{s}]: ", .{next.model}));
+            if (value.len > 0) next.model = value;
+        }
     }
     try validate(next);
     if (interactive and spec.auth == .key) {
@@ -470,25 +734,41 @@ fn configureProvider(c: *Config, id: []const u8, args: []const []const u8, inter
     }
     c.* = next;
 }
-fn choose(c: *Config) !void {
-    var options: std.ArrayList(terminal.ModelOption) = .empty;
-    for (providers.all) |spec| {
-        const label = if (std.mem.eql(u8, spec.id, "manual")) "Manual (Recommended) — no model needed" else spec.label;
-        try options.append(A, .{ .value = spec.id, .label = label });
-    }
-    if (!terminal.rich()) for (options.items, 0..) |option, i| try say("  {d}  {s}\n", .{ i + 1, option.label });
+fn choose(c: *Config, title: []const u8) !void {
+    var show_all = false;
     while (true) {
-        var id = try setupChoice("AI provider", options.items);
-        if (!terminal.rich() and providers.lookup(id) == null) {
+        var options: std.ArrayList(terminal.ModelOption) = .empty;
+        if (show_all) {
+            for (providers.all) |spec| {
+                const label = if (std.mem.eql(u8, spec.id, "manual")) "Manual — no model needed" else spec.label;
+                try options.append(A, .{ .value = spec.id, .label = label });
+            }
+        } else {
+            try options.appendSlice(A, &.{
+                .{ .value = "chatgpt", .label = "ChatGPT" },
+                .{ .value = "grok", .label = "Grok" },
+                .{ .value = "ollama", .label = "Local with Ollama" },
+                .{ .value = "more", .label = "More..." },
+            });
+        }
+        if (!terminal.rich()) for (options.items, 0..) |option, i| try say("  {d}  {s}\n", .{ i + 1, option.label });
+        const id = try setupChoice(title, options.items);
+        if (!show_all and (std.mem.eql(u8, id, "more") or std.mem.eql(u8, id, "4"))) {
+            show_all = true;
+            continue;
+        }
+        var provider_id = id;
+        if (!terminal.rich() and providers.lookup(provider_id) == null) {
             const index = if (id.len == 0) 1 else std.fmt.parseInt(usize, id, 10) catch 0;
             if (index == 0 or index > options.items.len) {
                 try say("Choose a number from 1 to {d}.\n", .{options.items.len});
                 continue;
             }
-            id = options.items[index - 1].value;
+            provider_id = options.items[index - 1].value;
         }
-        configureProvider(c, id, &.{}, true) catch |err| {
+        configureProvider(c, provider_id, &.{}, true) catch |err| {
             if (err == error.InputClosed or err == error.PickerCancelled) return err;
+            if (err == error.ProviderModelBack) continue;
             report(err);
             continue;
         };
@@ -516,15 +796,15 @@ fn folderSetup(c: *Config, template: folders.Template, custom_name: ?[]const u8,
 }
 fn organization(c: *Config) !void {
     try setupQuestion(2, "How would you like to organize your tasks?");
-    if (!terminal.rich()) try out("  1  Simple (Recommended) — one Markdown list\n  2  Custom — a folder and optional first task\n  3  Templates — projects or areas\n");
+    if (!terminal.rich()) try out("  1  Simple (Recommended) — one Markdown list\n  2  Choose a template — projects or areas\n  3  Custom — a folder and optional first task\n");
     while (true) {
-        const choice = try setupChoice("Organization", &.{
+        const choice = try setupChoice("2/4 How would you like to organize your tasks?", &.{
             .{ .value = "1", .label = "Simple (Recommended) — one Markdown list" },
-            .{ .value = "2", .label = "Custom — a folder and optional first task" },
-            .{ .value = "3", .label = "Templates — projects or areas" },
+            .{ .value = "2", .label = "Choose a template", .detail = "Projects or areas" },
+            .{ .value = "3", .label = "Custom — a folder and optional first task" },
         });
         if (choice.len == 0 or std.mem.eql(u8, choice, "1")) return folderSetup(c, .simple, null, null);
-        if (std.mem.eql(u8, choice, "2")) {
+        if (std.mem.eql(u8, choice, "3")) {
             while (true) {
                 const input = try prompt(A, "Folder name [Inbox]: ");
                 const name = if (input.len == 0) "Inbox" else input;
@@ -538,17 +818,20 @@ fn organization(c: *Config) !void {
                 return;
             }
         }
-        if (std.mem.eql(u8, choice, "3")) {
-            if (!terminal.rich()) try out("\n  1  Projects (Recommended) — Inbox, Projects, Archive\n  2  Areas — Personal, Work, Someday\n");
+        if (std.mem.eql(u8, choice, "2")) {
+            if (!terminal.rich()) try out("\n  1  Projects (Recommended) — Inbox, Projects, Archive\n  2  Areas — Personal, Work, Someday\n  3  Back\n");
             while (true) {
-                const template = try setupChoice("Template", &.{
+                const template = try setupChoiceWithBack("2/4 Template for your tasks", &.{
                     .{ .value = "1", .label = "Projects (Recommended) — Inbox, Projects, Archive" },
                     .{ .value = "2", .label = "Areas — Personal, Work, Someday" },
-                });
+                    .{ .value = setup_back, .label = "Back" },
+                }, true);
+                if (std.mem.eql(u8, template, setup_back) or std.mem.eql(u8, template, "3")) break;
                 if (template.len == 0 or std.mem.eql(u8, template, "1")) return folderSetup(c, .projects, null, null);
                 if (std.mem.eql(u8, template, "2")) return folderSetup(c, .areas, null, null);
-                try out("Choose 1 or 2.\n");
+                try out("Choose 1, 2, or 3.\n");
             }
+            continue;
         }
         try out("Choose 1, 2, or 3.\n");
     }
@@ -572,12 +855,14 @@ fn init(args: []const []const u8) !void {
         } else if (flag(args, "--task") != null) return error.InvalidFolderTemplate;
     } else {
         try say("\n{s} — a little room for what’s next.\n", .{app});
+        try themeStartup();
         try setupQuestion(1, "Where should your markdown live?");
         c.storage = try storageChoice();
         try std.fs.cwd().makePath(c.storage);
         try organization(&c);
-        try setupQuestion(3, "How would you like your AI?");
-        try choose(&c);
+        try onboardingAccent(&c);
+        try setupQuestion(4, "How would you like your AI?");
+        try choose(&c, "4/4 How would you like your AI?");
     }
     try save(c);
     try say("\nReady. Markdown: {s}/tasks.md\n", .{c.storage});
@@ -1258,7 +1543,7 @@ fn textArgs(args: []const []const u8, filter_yes: bool) ![]const u8 {
     return std.mem.join(A, " ", parts.items);
 }
 fn help() !void {
-    try say("\n{s} — tiny Markdown tasks, optional AI.\n\n  init                 Choose storage, organization, then optional AI\n  update               Install the latest verified release\n  uninstall            Remove doin; choose whether to keep task folders\n  list                 Show tasks\n  focus [N|pick|manual|status|off] Focus one task for today\n  focus step <text>    Save a short local next action\n  focus done          Complete today's focused task\n  add <text>           Add a task manually\n  done <number>        Complete a task\n  reopen <number>      Reopen a task\n  note <text>          Append Markdown\n  ask <question>       Ask about your contents\n  generate <request>   Preview AI-generated Markdown (--yes to save)\n  assist SERVER QUERY  AI with approved local or cloud:NAME tools\n  properties           Create or manage optional typed task properties\n  set N PROPERTY VALUE Set a value (omit fields for pickers)\n  unset N PROPERTY     Remove a task value\n  assign N [ACCOUNT]   Team member picker; none clears assignee\n  filter property K V  Filter a custom property\n  folder               List/create/rename/move/select folders\n  agents               Guidance status/init/update (--claude optional)\n  team                 doinWITH shared folders and account management\n  undo                 Undo the last write\n  model                Pick model, window and supported effort\n  provider             Connect, switch or skip AI\n  settings             Storage, model, notifications and account\n  review / prioritize  Read-only task review and priority preview\n  today / week / month Show tasks due in the local calendar\n  filter PROPERTY VALUE Filter due, status, priority, group or text\n  status STATE         Filter a registered task status\n  statuses             List/add/rename/remove task statuses\n  mark N STATE         Change task status (undo available)\n  unblock N [reason]   Ask AI for a small next step, read-only\n  visualize            Browse completion by group\n  delete <selector>    Preview removal by numbers, state or group\n  clear [selector]     Preview removal (default: completed tasks)\n  upgrade              Optional doinMORE cloud sync\n  mcp                  Local list/add/tools/call/remove; cloud for doinMORE\n  mcp cloud oauth      Connect hosted OAuth integrations\n  mcp cloud grants     List or review hosted access grants\n  mcp serve            Expose local tasks to Codex/Claude (--allow-write)\n  remind N TIME        Set a portable task reminder (e.g. in 15m)\n  remind list/off      View reminders or disable this device\n  login / logout [ID]  Selected AI provider account\n  voice                Optional local dictation helper\n  account              Manage email sign-in, plan, devices, and sync (subscribe [month|year])\n  sync auto            Configure background sync\n  sync <command>       login / status / push / pull / devices / revoke / billing / cancel / resume / recover / export / delete / logout\n  config / path        Show settings or Markdown path\n\nRun with no arguments for the interactive composer. Type ordinary task text or a question.\nSlash commands work there too. /add writes manually; /generate previews AI output; /update installs the latest verified release.\n", .{app});
+    try say("\n{s} — tiny Markdown tasks, optional AI.\n\n  init                 Choose storage, organization, then optional AI\n  update               Install the latest verified release\n  uninstall            Remove doin; choose whether to keep task folders\n  list                 Show tasks\n  focus [N|pick|manual|status|off] Focus one task for today\n  focus step <text>    Save a short local next action\n  focus done          Complete today's focused task\n  add <text>           Add a task manually\n  done <number>        Complete a task\n  reopen <number>      Reopen a task\n  note <text>          Append Markdown\n  ask <question>       Ask about your contents\n  generate <request>   Preview AI-generated Markdown (--yes to save)\n  assist SERVER QUERY  AI with approved local or cloud:NAME tools\n  properties           Create or manage optional typed task properties\n  set N PROPERTY VALUE Set a value (omit fields for pickers)\n  unset N PROPERTY     Remove a task value\n  assign N [ACCOUNT]   Team member picker; none clears assignee\n  filter property K V  Filter a custom property\n  folder               List/create/rename/move/select folders\n  agents               Guidance status/init/update (--claude optional)\n  team                 doinWITH shared folders, billing, portal, and account management\n  undo                 Undo the last write\n  model                Pick model, window and supported effort\n  provider             Connect, switch or skip AI\n  settings             Storage, model, notifications, account and theme\n  theme [default|#RRGGBB|sync] Set or sync this terminal accent\n  review / prioritize  Read-only task review and priority preview\n  today / week / month Show tasks due in the local calendar\n  filter PROPERTY VALUE Filter due, status, priority, group or text\n  status STATE         Filter a registered task status\n  statuses             List/add/rename/remove task statuses\n  mark N STATE         Change task status (undo available)\n  unblock N [reason]   Ask AI for a small next step, read-only\n  visualize            Browse completion by group\n  delete <selector>    Preview removal by numbers, state or group\n  clear [selector]     Preview removal (default: completed tasks)\n  upgrade              Optional doinMORE cloud sync\n  mcp                  Local list/add/tools/call/remove; cloud for doinMORE\n  mcp cloud oauth      Connect hosted OAuth integrations\n  mcp cloud grants     List or review hosted access grants\n  mcp serve            Expose local tasks to Codex/Claude (--allow-write)\n  remind N TIME        Set a portable task reminder (e.g. in 15m)\n  remind list/off      View reminders or disable this device\n  login / logout [ID]  Selected AI provider account\n  voice                Optional local dictation helper\n  account              Manage email sign-in, plan, devices, and sync (subscribe/change [month|year], portal)\n  sync auto            Configure background sync\n  sync <command>       login / status / push / pull / devices / revoke / billing / change / portal / cancel / resume / recover / export / delete / logout\n  config / path        Show settings or Markdown path\n\nRun with no arguments for the interactive composer. Type ordinary task text or a question.\nSlash commands work there too. /add writes manually; /generate previews AI output; /update installs the latest verified release.\n", .{app});
 }
 fn teamOutput(a: std.mem.Allocator, text: []const u8) !void {
     const clean = try terminal.clean(a, text, true);
@@ -1266,9 +1551,11 @@ fn teamOutput(a: std.mem.Allocator, text: []const u8) !void {
     try out(clean);
 }
 fn teamOpen(a: std.mem.Allocator, url: []const u8) !void {
+    if (url.len == 0 or url.len > 8192) return error.InvalidSyncResponse;
+    for (url) |ch| if (ch <= 32 or ch == 127) return error.InvalidSyncResponse;
     const uri = std.Uri.parse(url) catch return error.InvalidSyncResponse;
     const host = if (uri.host) |h| h.percent_encoded else return error.InvalidSyncResponse;
-    if (!std.mem.eql(u8, uri.scheme, "https") or (!std.mem.eql(u8, host, "checkout.stripe.com") and !std.mem.eql(u8, host, "invoice.stripe.com")) or uri.user != null or uri.password != null) return error.InvalidSyncResponse;
+    if (!std.mem.eql(u8, uri.scheme, "https") or (!std.mem.eql(u8, host, "checkout.stripe.com") and !std.mem.eql(u8, host, "invoice.stripe.com") and !std.mem.eql(u8, host, "billing.stripe.com")) or uri.user != null or uri.password != null or (uri.port != null and uri.port.? != 443)) return error.InvalidSyncResponse;
     try platform.openUrl(a, url);
 }
 fn teamActivate(a: std.mem.Allocator, config_dir: []const u8, team_id: []const u8, folder_id: []const u8, local_folder: []const u8, label: []const u8) !void {
@@ -1338,7 +1625,8 @@ fn personalSync(c: Config, args: []const []const u8) !void {
         defer library_root_in_flight = previous_root;
         return sync.runLibrary(A, args, try dir(), root, .{ .selected = librarySelected, .select = librarySelect });
     };
-    return sync.run(A, args, try dir(), c.storage);
+    try sync.run(A, args, try dir(), c.storage);
+    if (args.len > 0 and (std.mem.eql(u8, args[0], "login") or std.mem.eql(u8, args[0], "logout"))) try themeStartup();
 }
 fn folderPersist(c: Config, root: []const u8, selected: []const u8) !void {
     var next = c;
@@ -1641,7 +1929,8 @@ fn dispatch(c: Config, cmd: []const u8, args: []const []const u8) !void {
     }
     if (std.mem.eql(u8, cmd, "remind")) return reminderCommand(c, args);
     if (std.mem.eql(u8, cmd, "focus")) return focusCommand(c, args);
-    if (std.mem.eql(u8, cmd, "settings")) return settings(c);
+    if (std.mem.eql(u8, cmd, "theme")) return themeCommand(args);
+    if (std.mem.eql(u8, cmd, "settings")) return if (args.len > 0 and std.ascii.eqlIgnoreCase(args[0], "theme")) themeSettings() else settings(c);
     if (std.mem.eql(u8, cmd, "upgrade")) return upgrade();
     if (std.mem.eql(u8, cmd, "update")) return updater.run(A, args);
     for ([_][]const u8{ "review", "prioritize", "visualize", "delete", "clear", "today", "week", "month", "filter", "status", "mark", "unblock", "statuses" }) |name| if (std.mem.eql(u8, cmd, name)) return productivityCommand(c, cmd, args);
@@ -1659,13 +1948,13 @@ fn dispatch(c: Config, cmd: []const u8, args: []const []const u8) !void {
     if (std.mem.eql(u8, cmd, "model")) {
         if (!std.mem.eql(u8, c.provider, "manual") and platform.isTty(0)) return modelPicker(c);
         var next = c;
-        try choose(&next);
+        try choose(&next, "AI provider");
         try save(next);
         return;
     }
     if (std.mem.eql(u8, cmd, "provider")) {
         var next = c;
-        if (args.len == 0) try choose(&next) else try configureProvider(&next, args[0], args[1..], false);
+        if (args.len == 0) try choose(&next, "AI provider") else try configureProvider(&next, args[0], args[1..], false);
         return save(next);
     }
     if (std.mem.eql(u8, cmd, "login")) return loginProvider(if (args.len > 0) args[0] else if (std.mem.eql(u8, c.provider, "manual")) "chatgpt" else c.provider);
@@ -1715,8 +2004,11 @@ fn report(e: anyerror) void {
         error.InvalidStatusRegistry => "The Markdown status registry is malformed. Check its doin:statuses declaration before changing statuses.",
         error.InvalidTaskStatus => "Use a registered status. /statuses lists choices; example: /mark 2 doing.",
         error.InvalidEmail => "Enter a complete email address, then try /account login again.",
+        error.SyncEndpointMismatch => "The selected sync server differs from the saved sign-in. Sign in to the selected server before syncing this accent.",
         error.SyncLoginRequired, error.SyncSignInExpired => "Sync is signed out. Use /account login to continue with email.",
         error.SyncExistingSubscription => "You already have a subscription. Use /account status to view it, or /account to manage renewal and payment.",
+        error.SyncPaymentPending => "A subscription payment is pending. Use /account portal to update payment details, then check /account status.",
+        error.SyncRenewalCanceled => "Renewal is canceled. Use /account resume before changing the plan.",
         error.SyncSubscriptionRequired => "Sync needs an active plan. Use /account subscribe to open secure payment entry.",
         error.SyncLoginTimedOut => "Email verification timed out. Use /account login to request a fresh link.",
         error.SyncRateLimited => "Too many sync requests. Wait a moment, then retry.",
@@ -1725,7 +2017,11 @@ fn report(e: anyerror) void {
         error.SyncAccountMismatch => "The verified email differs from the requested account. Your saved sign-in was kept.",
         error.SyncDeviceNotFound => "Device not found. Use /account devices to see current device IDs.",
         error.InvalidSyncArguments, error.UnknownSyncCommand => "Use /account for account actions, or /help for sync commands.",
+        error.TeamSubscriptionNotActive => "The team subscription must be active before stopping personal renewal. Check /team billing after team payment.",
+        error.InvalidTeamArguments => "Use /team portal or /team replace-personal without extra arguments.",
         error.PickerCancelled => "Model selection cancelled. Settings kept.",
+        error.InvalidThemeAccent => "Use a six-digit accent such as #2A78C8.",
+        error.InvalidThemeArguments => "Use /theme default, /theme #RRGGBB, or /theme sync.",
         error.UnsupportedModelSetting => "This provider manages its own window and effort. Use default settings.",
         error.NoModelChoices, error.InvalidModelChoice => "No supported model choice. Check the provider connection, or use /provider.",
         error.InvalidSetting => "Choose a setting from 1 through 5, or press Enter to return.",
@@ -1894,7 +2190,7 @@ fn settings(c: Config) !void {
     try terminal.systemLine(A, "  Model    ", if (c.model.len > 0) c.model else "AI off");
     try terminal.systemLine(A, "  Window   ", if (c.context_tokens) |n| try std.fmt.allocPrint(A, "{d} tokens", .{n}) else "Provider default");
     try terminal.systemLine(A, "  Effort   ", c.effort orelse "Provider default");
-    try out("\n  1  Storage folder\n  2  AI provider\n  3  Model, window and effort\n  4  Notifications\n  5  Account and plan\n  6  MCP connections\n  7  Folders\n\n  Task views: /today /week /month /status /filter\n  Task actions: /mark /unblock /remind /statuses\n\n");
+    try out("\n  1  Storage folder\n  2  AI provider\n  3  Model, window and effort\n  4  Notifications\n  5  Account and plan\n  6  MCP connections\n  7  Folders\n  8  Theme accent\n\n  Task views: /today /week /month /status /filter\n  Task actions: /mark /unblock /remind /statuses\n\n");
     const choice = try prompt(A, "Setting [Enter to return]:");
     if (choice.len == 0) return;
     if (std.mem.eql(u8, choice, "1")) {
@@ -1912,12 +2208,12 @@ fn settings(c: Config) !void {
         try save(next);
     } else if (std.mem.eql(u8, choice, "2")) {
         var next = c;
-        try choose(&next);
+        try choose(&next, "AI provider");
         try save(next);
     } else if (std.mem.eql(u8, choice, "3")) {
         if (std.mem.eql(u8, c.provider, "manual")) {
             var next = c;
-            try choose(&next);
+            try choose(&next, "AI provider");
             try save(next);
         } else try modelPicker(c);
     } else if (std.mem.eql(u8, choice, "4")) {
@@ -1930,6 +2226,8 @@ fn settings(c: Config) !void {
         try terminal.systemLine(A, "  ", "doinMORE: /mcp cloud list · add NAME URL · tools NAME · call NAME TOOL JSON");
     } else if (std.mem.eql(u8, choice, "7")) {
         try folderCommand(c, &.{});
+    } else if (std.mem.eql(u8, choice, "8") or std.ascii.eqlIgnoreCase(choice, "theme")) {
+        try themeSettings();
     } else return error.InvalidSetting;
 }
 fn upgrade() !void {
@@ -1966,10 +2264,10 @@ fn account(c: Config, args: []const []const u8) !void {
     }
     if (!platform.isTty(0)) return sync.run(A, &.{"status"}, try dir(), c.storage);
     try terminal.heading(A, "Your account");
-    try out("  Optional sync. Your Markdown stays on this computer.\n\n  1  Continue with email\n  2  Account and plan\n  3  Devices\n  4  Send local changes\n  5  Get latest changes\n  6  Subscribe monthly or yearly\n  7  Cancel renewal\n  8  Sign out\n  9  Revoke a device\n  10 Export cloud Markdown\n  11 Resume renewal\n  12 Repair payment\n  13 Delete account\n\n");
+    try out("  Optional sync. Your Markdown stays on this computer.\n\n  1  Continue with email\n  2  Account and plan\n  3  Devices\n  4  Send local changes\n  5  Get latest changes\n  6  Subscribe monthly or yearly\n  7  Cancel renewal\n  8  Sign out\n  9  Revoke a device\n  10 Export cloud Markdown\n  11 Resume renewal\n  12 Repair payment\n  13 Delete account\n  14 Change monthly/yearly plan\n  15 Update payment method\n\n");
     const choice = try prompt(A, "Account action [Enter to go back]:");
     if (choice.len == 0) return;
-    const commands = [_][]const u8{ "login", "status", "devices", "push", "pull", "billing", "cancel", "logout", "revoke", "export", "resume", "recover", "delete" };
+    const commands = [_][]const u8{ "login", "status", "devices", "push", "pull", "billing", "cancel", "logout", "revoke", "export", "resume", "recover", "delete", "change", "portal" };
     const index = std.fmt.parseInt(usize, choice, 10) catch return error.InvalidAccountAction;
     if (index == 0 or index > commands.len) return error.InvalidAccountAction;
     if (index == 6) return upgrade();
@@ -2008,7 +2306,7 @@ fn argumentWord(text: []const u8, offset: *usize) !?[]const u8 {
 }
 fn interactiveArgs(cmd: []const u8, rest: []const u8) ![]const []const u8 {
     var args: std.ArrayList([]const u8) = .empty;
-    const structured = [_][]const u8{ "provider", "login", "logout", "mcp", "folder", "agents", "team", "properties", "set", "unset", "assign", "sync", "account", "remind", "filter", "status", "mark", "unblock", "statuses", "assist", "focus" };
+    const structured = [_][]const u8{ "theme", "provider", "login", "logout", "mcp", "folder", "agents", "team", "properties", "set", "unset", "assign", "sync", "account", "remind", "filter", "status", "mark", "unblock", "statuses", "assist", "focus" };
     var tokenize = false;
     for (structured) |name| if (std.mem.eql(u8, cmd, name)) {
         tokenize = true;
@@ -2038,7 +2336,7 @@ fn interactiveArgs(cmd: []const u8, rest: []const u8) ![]const []const u8 {
     return args.items;
 }
 fn command(cmd: []const u8, rest: []const u8) bool {
-    for ([_][]const u8{ "update", "provider", "login", "logout", "add", "done", "reopen", "note", "ask", "generate", "assist", "team", "folder", "agents", "mcp", "properties", "set", "unset", "assign", "sync", "account", "review", "prioritize", "visualize", "delete", "clear", "today", "week", "month", "filter", "status", "mark", "unblock", "statuses", "settings", "upgrade", "remind", "focus" }) |name| if (std.mem.eql(u8, cmd, name)) return true;
+    for ([_][]const u8{ "update", "provider", "login", "logout", "add", "done", "reopen", "note", "ask", "generate", "assist", "team", "folder", "agents", "mcp", "properties", "set", "unset", "assign", "sync", "account", "review", "prioritize", "visualize", "delete", "clear", "today", "week", "month", "filter", "status", "mark", "unblock", "statuses", "settings", "theme", "upgrade", "remind", "focus" }) |name| if (std.mem.eql(u8, cmd, name)) return true;
     if (rest.len == 0) for ([_][]const u8{ "list", "ls", "undo", "config", "path", "model", "provider", "login", "logout", "help", "voice", "focus" }) |name| if (std.mem.eql(u8, cmd, name)) return true;
     return false;
 }
@@ -2134,6 +2432,7 @@ fn run() !void {
     return runInteractive(config);
 }
 fn runInteractive(config: Config) !void {
+    try themeStartup();
     const initial = try read(try join(&.{ config.storage, "tasks.md" }));
     var meaningful = false;
     var lines = std.mem.splitScalar(u8, initial, '\n');
@@ -2163,7 +2462,7 @@ fn runInteractive(config: Config) !void {
             if (e == error.ModelPickerRequested) {
                 if (std.mem.eql(u8, current.provider, "manual")) {
                     var next = current;
-                    choose(&next) catch |err| {
+                    choose(&next, "AI provider") catch |err| {
                         report(err);
                         continue;
                     };

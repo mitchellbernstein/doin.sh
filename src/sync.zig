@@ -7,6 +7,14 @@ const Credentials = struct { endpoint: []const u8, token: []const u8 };
 const State = struct { identity: []const u8, revision: i64, base_hash: []const u8 };
 const Document = struct { revision: i64, content: []const u8 };
 const Response = struct { code: u16, body: []const u8 };
+pub const ThemePreferences = struct {
+    account_id: []const u8,
+    endpoint_hash: []const u8,
+    token_hash: []const u8,
+    accent: ?[]const u8,
+    revision: i64,
+};
+pub const ThemeCredential = struct { endpoint: []const u8, token_hash: []const u8 };
 pub const LibraryCallbacks = struct {
     selected: *const fn (A, []const u8) anyerror!?[]const u8,
     select: *const fn (A, []const u8, []const u8) anyerror!void,
@@ -232,10 +240,44 @@ fn account(a: A, config_dir: []const u8, c: Credentials) !void {
     const status = try string(billing, "status");
     try output("Account: ");
     try cleanOutput(a, email);
-    try output("\nPlan: ");
+    try output("\nSubscription: ");
     try cleanOutput(a, status);
     if (billing == .object) if (billing.object.get("cancel_at_period_end")) |cancel| if (cancel == .bool and cancel.bool) try output(" (renewal canceled)");
-    try output("\nUse sync devices, sync billing, or sync cancel here. No Markdown uploaded.\n");
+    const interval = optionalString(billing, "interval");
+    if (interval) |value_| {
+        try output("\nPlan interval: ");
+        try cleanOutput(a, value_);
+    }
+    if (optionalInteger(billing, "amount")) |amount| {
+        if (amount < 0 or !std.mem.eql(u8, try string(billing, "currency"), "usd")) return error.InvalidSyncResponse;
+        const cents: u64 = @intCast(amount);
+        try output("\nAmount: ");
+        try output(try std.fmt.allocPrint(a, "${d}.{d:0>2} USD", .{ @divTrunc(cents, 100), @mod(cents, 100) }));
+    }
+    if (optionalBool(billing, "pending_update") orelse false) {
+        try output("\nPayment pending");
+        if (optionalString(billing, "pending_interval")) |pending| {
+            try output(" for ");
+            try cleanOutput(a, pending);
+        }
+        try output(" interval. Use account portal to update payment details.\n");
+    } else try output("\n");
+    try output("Use account change month|year, account portal, sync devices, or sync cancel here. No Markdown uploaded.\n");
+}
+fn optionalString(v: std.json.Value, key: []const u8) ?[]const u8 {
+    const item = if (v == .object) v.object.get(key) else null;
+    if (item) |value_| if (value_ == .string) return value_.string;
+    return null;
+}
+fn optionalInteger(v: std.json.Value, key: []const u8) ?i64 {
+    const item = if (v == .object) v.object.get(key) else null;
+    if (item) |value_| if (value_ == .integer) return value_.integer;
+    return null;
+}
+fn optionalBool(v: std.json.Value, key: []const u8) ?bool {
+    const item = if (v == .object) v.object.get(key) else null;
+    if (item) |value_| if (value_ == .bool) return value_.bool;
+    return null;
 }
 fn devices(a: A, config_dir: []const u8, c: Credentials) !std.json.Value {
     const result = try success(a, try http(a, config_dir, c, "GET", "/v1/devices", null));
@@ -252,6 +294,62 @@ fn payment(result: std.json.Value, allowed_host: []const u8) !void {
     try output("Secure payment entry only. Open:\n");
     try output(url);
     try output("\nReturn here and run sync status when payment completes.\n");
+}
+fn stripePortal(result: std.json.Value) ![]const u8 {
+    const url = try string(result, "url");
+    for (url) |ch| if (ch <= 32 or ch == 127) return error.InvalidCheckoutURL;
+    const uri = std.Uri.parse(url) catch return error.InvalidCheckoutURL;
+    const host = if (uri.host) |h| h.percent_encoded else return error.InvalidCheckoutURL;
+    if (!std.mem.eql(u8, uri.scheme, "https") or !std.mem.eql(u8, host, "billing.stripe.com") or uri.user != null or uri.password != null or (uri.port != null and uri.port.? != 443)) return error.InvalidCheckoutURL;
+    return url;
+}
+fn validInterval(value_: []const u8) bool {
+    return std.mem.eql(u8, value_, "month") or std.mem.eql(u8, value_, "year");
+}
+fn billingChange(a: A, config_dir: []const u8, c: Credentials, interval: []const u8) !void {
+    if (!validInterval(interval)) return error.InvalidSyncArguments;
+    const current = try success(a, try http(a, config_dir, c, "GET", "/v1/billing", null));
+    const pending = optionalBool(current, "pending_update") orelse return error.InvalidSyncResponse;
+    if (pending) return error.SyncPaymentPending;
+    if (optionalBool(current, "cancel_at_period_end") orelse return error.InvalidSyncResponse) return error.SyncRenewalCanceled;
+    const current_interval = optionalString(current, "interval") orelse return error.InvalidSyncResponse;
+    if (!validInterval(current_interval)) return error.InvalidSyncResponse;
+    if (std.mem.eql(u8, current_interval, interval)) {
+        try output(try std.fmt.allocPrint(a, "Already on the {s} interval. Subscription unchanged.\n", .{interval}));
+        return;
+    }
+    const preview = try success(a, try http(a, config_dir, c, "POST", "/v1/billing/change", try std.json.Stringify.valueAlloc(a, .{ .interval = interval }, .{})));
+    if (optionalBool(preview, "confirmation_required") != true) {
+        const unchanged = optionalBool(preview, "changed") == false and optionalBool(preview, "payment_pending") == false;
+        if (unchanged and std.mem.eql(u8, try string(preview, "interval"), interval) and optionalString(preview, "pending_interval") == null) {
+            try output(try std.fmt.allocPrint(a, "Already on the {s} interval. Subscription unchanged.\n", .{interval}));
+            return;
+        }
+        return error.InvalidSyncResponse;
+    }
+    const quote_id = try string(preview, "quote_id");
+    const amount = try integer(preview, "amount_due");
+    if (quote_id.len == 0 or quote_id.len > 256 or amount == std.math.minInt(i64) or !std.mem.eql(u8, try string(preview, "interval"), interval) or !std.mem.eql(u8, try string(preview, "currency"), "usd")) return error.InvalidSyncResponse;
+    const absolute_amount: u64 = @intCast(if (amount < 0) -amount else amount);
+    const detail = if (amount < 0) "credit" else "amount due now";
+    try output(try std.fmt.allocPrint(a, "Change subscription to {s}; {s} ${d}.{d:0>2} USD.\n", .{ interval, detail, @divTrunc(absolute_amount, 100), @mod(absolute_amount, 100) }));
+    if (!try yes(a, &.{}, "Confirm this subscription change and displayed charge? [y/N]")) return output("Subscription unchanged.\n");
+    const body = try std.json.Stringify.valueAlloc(a, .{ .interval = interval, .quote_id = quote_id, .confirm_amount = amount }, .{});
+    const result = try success(a, try http(a, config_dir, c, "POST", "/v1/billing/change", body));
+    if (optionalBool(result, "confirmation_required") == true) {
+        const replacement_quote = try string(result, "quote_id");
+        const replacement_amount = try integer(result, "amount_due");
+        if (replacement_quote.len == 0 or replacement_quote.len > 256 or replacement_amount == std.math.minInt(i64) or !std.mem.eql(u8, try string(result, "interval"), interval) or !std.mem.eql(u8, try string(result, "currency"), "usd")) return error.InvalidSyncResponse;
+        return output("Charge changed. No subscription change made. Run account change again to review a fresh quote.\n");
+    }
+    const payment_pending = optionalBool(result, "payment_pending") orelse return error.InvalidSyncResponse;
+    if (payment_pending) {
+        if (optionalBool(result, "changed") != false or !validInterval(try string(result, "interval")) or !std.mem.eql(u8, try string(result, "pending_interval"), interval)) return error.InvalidSyncResponse;
+        try output("Plan change is awaiting payment. Use account portal to update payment details, then account status to check it.\n");
+        return;
+    }
+    if (optionalBool(result, "changed") != true or !std.mem.eql(u8, try string(result, "interval"), interval)) return error.InvalidSyncResponse;
+    try output("Subscription interval changed.\n");
 }
 fn managed(a: A, args: []const []const u8, config_dir: []const u8, c: Credentials) !bool {
     const cmd = args[0];
@@ -297,6 +395,27 @@ fn managed(a: A, args: []const []const u8, config_dir: []const u8, c: Credential
         if (!std.mem.eql(u8, interval, "month") and !std.mem.eql(u8, interval, "year")) return error.InvalidSyncArguments;
         const result = try success(a, try http(a, config_dir, c, "POST", "/v1/checkout", try std.json.Stringify.valueAlloc(a, .{ .interval = interval }, .{})));
         try payment(result, "checkout.stripe.com");
+        return true;
+    }
+    if (std.mem.eql(u8, cmd, "change")) {
+        if (args.len != 2) return error.InvalidSyncArguments;
+        try billingChange(a, config_dir, c, args[1]);
+        return true;
+    }
+    if (std.mem.eql(u8, cmd, "portal")) {
+        if (args.len != 1) return error.InvalidSyncArguments;
+        if (!try yes(a, args, "Open the Stripe billing portal to manage payment details? [y/N]")) {
+            try output("Billing portal kept closed.\n");
+            return true;
+        }
+        const result = try success(a, try http(a, config_dir, c, "POST", "/v1/billing/portal", "{}"));
+        const url = try stripePortal(result);
+        try output("Opening Stripe billing portal.\n");
+        @import("platform.zig").openUrl(a, url) catch {
+            try output("Browser could not open. Use this secure Stripe link:\n");
+            try output(url);
+            try output("\n");
+        };
         return true;
     }
     if (std.mem.eql(u8, cmd, "cancel")) {
@@ -438,6 +557,110 @@ fn credentials(a: A, config_dir: []const u8) !Credentials {
         else => return err,
     };
 }
+fn ensureThemeEndpoint(a: A, config_dir: []const u8, c: Credentials) !void {
+    const selected = try configuredEndpoint(a, config_dir);
+    const saved = std.mem.trimEnd(u8, c.endpoint, "/");
+    if (!std.mem.eql(u8, saved, std.mem.trimEnd(u8, selected, "/"))) return error.SyncEndpointMismatch;
+}
+
+fn preferenceValue(a: A, response: Response) !std.json.Value {
+    switch (response.code) {
+        200 => {},
+        401 => return error.SyncSignInExpired,
+        402 => return error.SyncSubscriptionRequired,
+        429 => return error.SyncRateLimited,
+        503 => return error.SyncUnavailable,
+        409 => {},
+        else => return error.ThemePreferencesUnavailable,
+    }
+    return (std.json.parseFromSlice(std.json.Value, a, response.body, .{ .allocate = .alloc_always }) catch return error.InvalidSyncResponse).value;
+}
+
+fn preferenceFields(value_: std.json.Value) !struct { accent: ?[]const u8, revision: i64 } {
+    const parsed_preferences = if (value_ == .object and value_.object.get("preferences") != null) value_.object.get("preferences").? else value_;
+    if (parsed_preferences != .object) return error.InvalidSyncResponse;
+    const revision_value = parsed_preferences.object.get("revision") orelse return error.InvalidSyncResponse;
+    if (revision_value != .integer or revision_value.integer < 0 or revision_value.integer > 9007199254740991) return error.InvalidSyncResponse;
+    const accent_value = parsed_preferences.object.get("accent") orelse return error.InvalidSyncResponse;
+    var accent: ?[]const u8 = null;
+    switch (accent_value) {
+        .null => {},
+        .string => |text| {
+            if (text.len != 7 or text[0] != '#') return error.InvalidSyncResponse;
+            for (text[1..]) |ch| if (!((ch >= '0' and ch <= '9') or (ch >= 'A' and ch <= 'F'))) return error.InvalidSyncResponse;
+            accent = text;
+        },
+        else => return error.InvalidSyncResponse,
+    }
+    return .{ .accent = accent, .revision = revision_value.integer };
+}
+
+fn accountPreferencesUntil(a: A, config_dir: []const u8, c: Credentials, deadline: i64) !ThemePreferences {
+    const identity = try preferenceValue(a, try httpBudget(a, config_dir, c, "GET", "/v1/account", null, deadline));
+    const account_id = try string(identity, "id");
+    if (account_id.len == 0 or account_id.len > 256) return error.InvalidSyncResponse;
+    if (c.token.len == 0) return error.SyncLoginRequired;
+    const response = try preferenceValue(a, try httpBudget(a, config_dir, c, "GET", "/v1/account/preferences", null, deadline));
+    const fields = try preferenceFields(response);
+    return .{ .account_id = account_id, .endpoint_hash = try hash(a, c.endpoint), .token_hash = try hash(a, c.token), .accent = fields.accent, .revision = fields.revision };
+}
+
+fn ensurePreferencesAccount(a: A, config_dir: []const u8, pinned: Credentials) !void {
+    const current = try credentials(a, config_dir);
+    if (!std.mem.eql(u8, current.endpoint, pinned.endpoint) or !std.mem.eql(u8, current.token, pinned.token)) return error.SyncAccountChanged;
+}
+
+pub fn getThemePreferences(a: A, config_dir: []const u8, budget_ms: i64) !ThemePreferences {
+    if (budget_ms <= 0) return error.ThemePreferencesTimedOut;
+    const c = try credentials(a, config_dir);
+    try ensureThemeEndpoint(a, config_dir, c);
+    const deadline = std.time.milliTimestamp() + budget_ms;
+    const result = try accountPreferencesUntil(a, config_dir, c, deadline);
+    try ensurePreferencesAccount(a, config_dir, c);
+    return result;
+}
+
+pub fn themeCredential(a: A, config_dir: []const u8) !ThemeCredential {
+    const c = try credentials(a, config_dir);
+    try ensureThemeEndpoint(a, config_dir, c);
+    try endpointCheck(c.endpoint);
+    try tokenCheck(c.token);
+    return .{ .endpoint = c.endpoint, .token_hash = try hash(a, c.token) };
+}
+
+pub fn setThemePreferences(a: A, config_dir: []const u8, accent_value: ?[]const u8, base_revision: ?i64, budget_ms: i64) !ThemePreferences {
+    if (budget_ms <= 0) return error.ThemePreferencesTimedOut;
+    if (accent_value) |text| {
+        if (text.len != 7 or text[0] != '#') return error.InvalidThemeAccent;
+        for (text[1..]) |ch| if (!((ch >= '0' and ch <= '9') or (ch >= 'A' and ch <= 'F'))) return error.InvalidThemeAccent;
+    }
+    const c = try credentials(a, config_dir);
+    try ensureThemeEndpoint(a, config_dir, c);
+    const deadline = std.time.milliTimestamp() + budget_ms;
+    const identity = try preferenceValue(a, try httpBudget(a, config_dir, c, "GET", "/v1/account", null, deadline));
+    const account_id = try string(identity, "id");
+    if (account_id.len == 0 or account_id.len > 256) return error.InvalidSyncResponse;
+    try ensurePreferencesAccount(a, config_dir, c);
+    var revision = if (base_revision) |base_value| base_value else (try accountPreferencesUntil(a, config_dir, c, deadline)).revision;
+    if (revision < 0 or revision > 9007199254740991) return error.InvalidSyncResponse;
+    for (0..2) |attempt| {
+        const body = try std.json.Stringify.valueAlloc(a, .{ .accent = accent_value, .revision = revision }, .{});
+        const response = try httpBudget(a, config_dir, c, "PUT", "/v1/account/preferences", body, deadline);
+        try ensurePreferencesAccount(a, config_dir, c);
+        if (response.code == 409) {
+            const conflict = try preferenceValue(a, response);
+            const current = try preferenceFields(conflict);
+            revision = current.revision;
+            if (attempt == 1) return error.ThemePreferenceConflict;
+            continue;
+        }
+        const saved_value = try preferenceValue(a, response);
+        const saved = try preferenceFields(saved_value);
+        if (saved.revision < revision or !std.mem.eql(u8, saved.accent orelse "", accent_value orelse "")) return error.InvalidSyncResponse;
+        return .{ .account_id = account_id, .endpoint_hash = try hash(a, c.endpoint), .token_hash = try hash(a, c.token), .accent = saved.accent, .revision = saved.revision };
+    }
+    return error.ThemePreferenceConflict;
+}
 
 pub fn autoTick(a: A, config_dir: []const u8, storage: []const u8) !@import("sync_background.zig").Report {
     const c = try credentials(a, config_dir);
@@ -528,7 +751,7 @@ pub fn run(a: A, args: []const []const u8, config_dir: []const u8, storage: []co
         try std.fs.cwd().deleteFile(p);
         return output("Signed out; this device session revoked. Local Markdown kept.\n");
     }
-    if (args.len > 0 and (std.mem.eql(u8, cmd, "devices") or std.mem.eql(u8, cmd, "revoke") or std.mem.eql(u8, cmd, "billing") or std.mem.eql(u8, cmd, "cancel") or std.mem.eql(u8, cmd, "resume") or std.mem.eql(u8, cmd, "recover") or std.mem.eql(u8, cmd, "export") or std.mem.eql(u8, cmd, "delete"))) {
+    if (args.len > 0 and (std.mem.eql(u8, cmd, "devices") or std.mem.eql(u8, cmd, "revoke") or std.mem.eql(u8, cmd, "billing") or std.mem.eql(u8, cmd, "change") or std.mem.eql(u8, cmd, "portal") or std.mem.eql(u8, cmd, "cancel") or std.mem.eql(u8, cmd, "resume") or std.mem.eql(u8, cmd, "recover") or std.mem.eql(u8, cmd, "export") or std.mem.eql(u8, cmd, "delete"))) {
         _ = try managed(a, args, config_dir, try credentials(a, config_dir));
         return;
     }

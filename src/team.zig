@@ -129,8 +129,10 @@ fn digest(a: A, data: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{x}", .{h});
 }
 fn urlCheck(url: []const u8, host: []const u8) !void {
+    if (url.len == 0 or url.len > 8192) return error.InvalidTeamCheckoutUrl;
+    for (url) |ch| if (ch <= 32 or ch == 127) return error.InvalidTeamCheckoutUrl;
     const u = try std.Uri.parse(url);
-    if (!equal(u.scheme, "https") or u.host == null or !equal(u.host.?.percent_encoded, host) or u.user != null or u.password != null or u.port != null) return error.InvalidTeamCheckoutUrl;
+    if (!equal(u.scheme, "https") or u.host == null or !equal(u.host.?.percent_encoded, host) or u.user != null or u.password != null or (u.port != null and u.port.? != 443)) return error.InvalidTeamCheckoutUrl;
 }
 fn seatsParse(raw: []const u8) !u32 {
     const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidTeamSeats;
@@ -166,7 +168,7 @@ pub fn run(a: A, config: []const u8, args: []const []const u8, io: Adapter) !voi
         return;
     }
     if (equal(command, "help")) {
-        try io.output(a, "doinWITH · $99/user/year · shared team workspaces\n\nteam list · create · switch <id> · members · invite <email> [admin] · accept\nteam remove <account> · transfer <account> · leave · billing · subscribe <seats>\nteam seats <count> · seats-reset · cancel · resume · recover · receipt <file>\nteam folders · folder-create <name> [parent] · folder-select <id>\nteam folder-grant <folder> <account> [read|write] · folder-revoke <folder> <account>\nteam folder <local path> · push · pull · export <file> · delete\n");
+        try io.output(a, "doinWITH · $99/user/year · shared team workspaces\n\nteam list · create · switch <id> · members · invite <email> [admin] · accept\nteam remove <account> · transfer <account> · leave · billing · subscribe <seats> · portal\nteam seats <count> · seats-reset · cancel · resume · recover · replace-personal · receipt <file>\nteam folders · folder-create <name> [parent] · folder-select <id>\nteam folder-grant <folder> <account> [read|write] · folder-revoke <folder> <account>\nteam folder <local path> · push · pull · export <file> · delete\n");
         return;
     }
     if (equal(command, "list")) {
@@ -241,6 +243,29 @@ pub fn run(a: A, config: []const u8, args: []const []const u8, io: Adapter) !voi
         const url = try str(result, "url");
         try urlCheck(url, "invoice.stripe.com");
         if (try askYes(a, io, "Open Stripe invoice to recover team payment? Type yes")) try io.open(a, url);
+        return;
+    }
+    if (equal(command, "portal")) {
+        if (args.len != 1) return error.InvalidTeamArguments;
+        if (!try askYes(a, io, "Open the Stripe billing portal for this team? Type yes")) return;
+        const result = try send(a, config, io, "POST", try std.fmt.allocPrint(a, "{s}/portal", .{base}), .{});
+        const url = try str(result, "url");
+        try urlCheck(url, "billing.stripe.com");
+        io.open(a, url) catch {
+            try io.output(a, try std.fmt.allocPrint(a, "Browser could not open. Use this secure Stripe link:\n{s}\n", .{url}));
+        };
+        return;
+    }
+    if (equal(command, "replace-personal")) {
+        if (args.len != 1) return error.InvalidTeamArguments;
+        const billing = try io.request(a, config, "GET", try std.fmt.allocPrint(a, "{s}/billing", .{base}), null);
+        const paid_seats = try int(billing, "paid_seats");
+        if (!flag(billing, "active") or paid_seats < 1) return error.TeamSubscriptionNotActive;
+        try io.output(a, "This stops renewal of your separate doinMORE personal subscription. Its paid term continues; the team subscription stays active. Personal and team folders remain separate, and no files move.\n");
+        if (!try askYes(a, io, "Stop personal renewal now? Type yes")) return;
+        const result = try send(a, config, io, "POST", try std.fmt.allocPrint(a, "{s}/personal-renewal/cancel", .{base}), .{ .confirmation = "cancel personal renewal" });
+        if (!flag(result, "cancel_at_period_end")) return error.InvalidTeamResponse;
+        try io.output(a, "Personal renewal stopped. Paid access continues through its current term; team billing stays active.\n");
         return;
     }
     if (equal(command, "invite")) {

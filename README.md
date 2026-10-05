@@ -4,7 +4,7 @@ A tiny native terminal home for tasks and notes. Plain Markdown. Optional AI. Yo
 
 **Tiny terminal tasks. Markdown storage. Your choice of AI.**
 
-Early release for macOS, Linux, and Windows. Native iOS work is in progress; the iOS app is not a published release.
+Early terminal release for macOS, Linux, and Windows. Native Apple apps are development builds, not published releases. The [Mac app](macos/README.md) uses the iOS app's Markdown library and services with a native window or menu bar interface.
 
 ```text
   1  [ ]  Review migration
@@ -31,7 +31,7 @@ On macOS with a newer SDK unsupported by Zig 0.15.2, use the task-local SDK fall
 
 On macOS and Linux, run `doin update` to install a newer public release into the current executable location. It works before setup, verifies the release archive against `SHA256SUMS`, and preserves tasks and settings. Current or newer installed versions stay in place. Download or verification failures leave the installed binary untouched. Release discovery follows the [GitHub Releases API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release).
 
-Run `doin uninstall` to remove the terminal executable and its settings, even before first setup. Keeping task folders is the default. To delete the listed folders and all their contents, select the second option, type `DELETE`, and confirm. Cancelling removes nothing. Unrelated tools and config files stay in place. The filesystem cleanup uses the matching [Zig 0.15.2 APIs](https://ziglang.org/documentation/0.15.2/).
+Run `doin uninstall` to remove the terminal executable and its settings, even before first setup. Confirm the uninstall, then answer whether to delete the listed task folders and ALL their contents; answering no keeps them. Cancelling either question removes nothing. Unrelated tools and config files stay in place. The filesystem cleanup uses the matching [Zig 0.15.2 APIs](https://ziglang.org/documentation/0.15.2/).
 
 ## Everyday use
 

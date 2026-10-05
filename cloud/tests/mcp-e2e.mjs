@@ -56,7 +56,7 @@ const pass=n=>{checks.push(n);console.log('PASS '+n);};
 try{
  const {outputFiles}=await build({entryPoints:[new URL('worker.ts',root).pathname],bundle:true,external:['cloudflare:workers'],format:'esm',platform:'browser',write:false});
  mf=new Miniflare(convertV4MiniflareOptions({workers:[{name:'doin-mcp',modules:true,script:outputFiles[0].text,compatibilityDate:'2026-10-01',d1Databases:['DB'],kvNamespaces:['OAUTH_KV'],bindings:{ORIGIN:'https://sync.doin.sh',STRIPE_SECRET_KEY:'sk_test_fixture',STRIPE_PRICE_ID:'price_legacy',STRIPE_MONTHLY_PRICE_ID:'price_month',STRIPE_YEARLY_PRICE_ID:'price_year',MCP_ENCRYPTION_KEY:'ab'.repeat(32)},outboundService:outbound}]}));
- const db=await mf.getD1Database('DB');dbRef=db;for(const file of ['0001','0002','0003','0004','0005','0006','0007','0008','0009'])await db.exec((await readFile(new URL(`migrations/${file}.sql`,root),'utf8')).replaceAll('\n',' '));
+ const db=await mf.getD1Database('DB');dbRef=db;for(const file of ['0001','0002','0003','0004','0005','0006','0007','0008','0009','0010'])await db.exec((await readFile(new URL(`migrations/${file}.sql`,root),'utf8')).replaceAll('\n',' '));
  const tokens={alice:'a'.repeat(64),bob:'b'.repeat(64)};
  for(const name of Object.keys(tokens)){
   await db.prepare('INSERT INTO accounts(id,identity_key,email,name,customer_id,created_at) VALUES(?,?,?,?,?,?)').bind(name,name,name+'@example.test',name,'cus_'+name,0).run();

@@ -14,7 +14,6 @@ pub const UninstallPlan = struct {
 };
 pub const Input = struct {
     prompt: *const fn (A, []const u8) anyerror![]const u8,
-    choose: *const fn () anyerror![]const u8,
 };
 fn output(a: A, comptime format: []const u8, args: anytype) !void {
     const raw = try std.fmt.allocPrint(a, format, args);
@@ -59,7 +58,13 @@ fn safeRoot(a: A, plan: UninstallPlan, raw: []const u8) ![]const u8 {
     return root;
 }
 fn owned(name: []const u8) bool {
-    for ([_][]const u8{ "config.json", "chatgpt.json", "chatgpt-registration.json", "grok.json", "vercel.json", "openrouter.json", "sync.json", "team.json", "mcp-servers.json", "host-id", ".auth.lock", ".mcp-servers.lock" }) |known| if (std.mem.eql(u8, name, known)) return true;
+    for ([_][]const u8{ "config.json", "chatgpt.json", "chatgpt-registration.json", "grok.json", "vercel.json", "openrouter.json", "sync.json", "team.json", "mcp-servers.json", "host-id", ".auth.lock", ".mcp-servers.lock", "theme-local.json" }) |known| if (std.mem.eql(u8, name, known)) return true;
+    for ([_][]const u8{ "theme-account-", "theme-pending-" }) |prefix| if (std.mem.startsWith(u8, name, prefix) and std.mem.endsWith(u8, name, ".json")) {
+        const digest = name[prefix.len .. name.len - 5];
+        if (digest.len != 64) return false;
+        for (digest) |ch| if (!std.ascii.isHex(ch)) return false;
+        return true;
+    };
     if (std.mem.startsWith(u8, name, "auto-sync-")) {
         for ([_][]const u8{ ".running.lock", ".lock" }) |suffix| if (std.mem.endsWith(u8, name, suffix)) {
             const digest = name[10 .. name.len - suffix.len];
@@ -107,10 +112,10 @@ pub fn run(a: A, plan: UninstallPlan, input: Input) !void {
     try output(a, "Uninstall doin\nTerminal executable: {s}\nApp settings and credentials: {s}\n", .{ plan.executable, plan.config_dir });
     if (!plan.config_readable) try output(a, "Settings unavailable; task deletion is disabled.\n", .{});
     for (plan.task_roots) |root| try output(a, "Task folder: {s}\n", .{root});
-    if (!terminal.rich()) try output(a, "\n1  Keep task folders (Recommended)\n2  Delete task folders and ALL their contents\n", .{});
-    const choice = std.mem.trim(u8, try input.choose(), " \r\n\t");
-    const deleting = std.mem.eql(u8, choice, "2") or std.mem.eql(u8, choice, "delete");
-    if (!deleting and choice.len != 0 and !std.mem.eql(u8, choice, "1") and !std.mem.eql(u8, choice, "keep")) return error.InvalidUninstallChoice;
+    const confirmation = std.mem.trim(u8, try input.prompt(a, "Uninstall doin and remove its executable and app settings? [y/N]: "), " \r\n\t");
+    if (!std.ascii.eqlIgnoreCase(confirmation, "y") and !std.ascii.eqlIgnoreCase(confirmation, "yes")) return output(a, "Cancelled. Nothing removed.\n", .{});
+    const delete_answer = std.mem.trim(u8, try input.prompt(a, "Delete task folders and ALL their contents? [y/N]: "), " \r\n\t");
+    const deleting = std.ascii.eqlIgnoreCase(delete_answer, "y") or std.ascii.eqlIgnoreCase(delete_answer, "yes");
     var roots: std.ArrayList([]const u8) = .empty;
     if (deleting) {
         if (!plan.config_readable) return error.UninstallStorageUnknown;
@@ -135,10 +140,7 @@ pub fn run(a: A, plan: UninstallPlan, input: Input) !void {
             }
         }
         for (roots.items) |root| try output(a, "Will permanently delete: {s}\n", .{root});
-        if (!std.mem.eql(u8, std.mem.trim(u8, try input.prompt(a, "Type DELETE to delete ALL contents: "), " \r\n\t"), "DELETE")) return output(a, "Cancelled. Nothing removed.\n", .{});
     }
-    const answer = std.mem.trim(u8, try input.prompt(a, "Remove doin executable and app settings? [y/N]: "), " \r\n\t");
-    if (!std.ascii.eqlIgnoreCase(answer, "y") and !std.ascii.eqlIgnoreCase(answer, "yes")) return output(a, "Cancelled. Nothing removed.\n", .{});
     var settings = std.fs.cwd().openDir(plan.config_dir, .{ .no_follow = true }) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,

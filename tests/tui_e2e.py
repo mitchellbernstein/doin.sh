@@ -6,6 +6,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--bin', default='zig-out/bin/doin')
 parser.add_argument('--artifacts', default='artifacts/tui-e2e')
 parser.add_argument('--baseline', default='')
+parser.add_argument('--case', help='Run only the exact named E2E case')
 args = parser.parse_args()
 binary = pathlib.Path(args.bin).resolve(); artifacts = pathlib.Path(args.artifacts).resolve(); artifacts.mkdir(parents=True, exist_ok=True)
 cases, requests, captures, restorations = [], [], [], []
@@ -17,9 +18,9 @@ except ImportError:
     Image = None
 
 
-def screen(raw, cols, rows):
-    cells = [[(' ', '#eeeeee', False, '#111111') for _ in range(cols)] for _ in range(rows)]
-    x = y = 0; top = 0; bottom = rows - 1; saved = (0, 0); color = '#eeeeee'; bold = False; background = '#111111'
+def screen(raw, cols, rows, default_foreground='#eeeeee', default_background='#111111'):
+    cells = [[(' ', default_foreground, False, default_background) for _ in range(cols)] for _ in range(rows)]
+    x = y = 0; top = 0; bottom = rows - 1; saved = (0, 0); color = default_foreground; bold = False; background = default_background; inverse = False
     text = raw.decode('utf-8', errors='replace'); i = 0
     while i < len(text):
         c = text[i]
@@ -51,8 +52,12 @@ def screen(raw, cols, rows):
                     index = 0
                     while index < len(numbers):
                         code = numbers[index]
-                        if code == 0: color = '#eeeeee'; bold = False; background = '#111111'
+                        if code == 0: color = default_foreground; bold = False; background = default_background; inverse = False
                         elif code == 1: bold = True
+                        elif code == 7: inverse = True
+                        elif code == 27: inverse = False
+                        elif code == 39: color = default_foreground
+                        elif code == 49: background = default_background
                         elif code == 36: color = '#67d6db'
                         elif code in (38, 48) and numbers[index + 1:index + 2] == [2] and index + 4 < len(numbers):
                             rgb = '#' + ''.join(f'{v:02x}' for v in numbers[index + 2:index + 5])
@@ -76,15 +81,16 @@ def screen(raw, cols, rows):
             if y==bottom: cells.pop(top); cells.insert(bottom,[(' ',color,bold,background) for _ in range(cols)])
             elif y<rows-1: y+=1
         if width:
-            cells[y][x] = (c, color, bold, background)
-            if width == 2 and x + 1 < cols: cells[y][x + 1] = ('', color, bold, background)
+            foreground, cell_background = (background, color) if inverse else (color, background)
+            cells[y][x] = (c, foreground, bold, cell_background)
+            if width == 2 and x + 1 < cols: cells[y][x + 1] = ('', foreground, bold, cell_background)
             x += width
     return cells
 
 
 class Terminal:
-    def __init__(self, executable, env, cols=88, rows=32):
-        self.cols, self.rows = cols, rows; self.raw = bytearray()
+    def __init__(self, executable, env, cols=88, rows=32, background='#111111'):
+        self.cols, self.rows = cols, rows; self.raw = bytearray(); self.background = background; self.foreground = '#111111' if int(background[1:],16) > 0x7f7f7f else '#eeeeee'; self.osc_answered = {'10':0,'11':0}
         self.master, self.slave = pty.openpty(); self.original = termios.tcgetattr(self.slave)
         self.resize(cols, rows)
         self.process = subprocess.Popen([str(executable)], env=env, stdin=self.slave, stdout=self.slave, stderr=self.slave, start_new_session=True)
@@ -99,6 +105,12 @@ class Terminal:
                 except OSError: break
                 if not data: break
                 self.raw.extend(data)
+                for code, color in (('10',self.foreground),('11',self.background)):
+                    queries=self.raw.count(f'\x1b]{code};?\x07'.encode())
+                    while self.osc_answered[code] < queries:
+                        self.osc_answered[code] += 1
+                        rgb=tuple(int(color[index:index+2],16)*257 for index in (1,3,5))
+                        os.write(self.master, f'\x1b]{code};rgb:{rgb[0]:04x}/{rgb[1]:04x}/{rgb[2]:04x}\x07'.encode())
     def wait(self, marker, offset=0, timeout=8):
         deadline = time.monotonic() + timeout
         while marker.encode() not in self.raw[offset:]:
@@ -118,17 +130,17 @@ class Terminal:
     def capture(self, name):
         self.pump(); raw = bytes(self.raw)
         (artifacts / (name + '.ansi')).write_bytes(raw)
-        grid = screen(raw, self.cols, self.rows)
+        grid = screen(raw, self.cols, self.rows, self.foreground, self.background)
         lines = [''.join(c[0] for c in row).rstrip() for row in grid]
         (artifacts / (name + '.txt')).write_text('\n'.join(lines) + '\n')
-        elements = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.cols * 9 + 32}" height="{self.rows * 20 + 32}" viewBox="0 0 {self.cols * 9 + 32} {self.rows * 20 + 32}"><rect width="100%" height="100%" fill="#111111"/>']
+        elements = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.cols * 9 + 32}" height="{self.rows * 20 + 32}" viewBox="0 0 {self.cols * 9 + 32} {self.rows * 20 + 32}"><rect width="100%" height="100%" fill="{self.background}"/>']
         for yy, row in enumerate(grid):
             for xx, (char, color, bold, background) in enumerate(row):
-                if background != '#111111': elements.append(f'<rect x="{16 + xx * 9}" y="{16 + yy * 20}" width="9" height="20" fill="{background}"/>')
+                if background != self.background: elements.append(f'<rect x="{16 + xx * 9}" y="{16 + yy * 20}" width="9" height="20" fill="{background}"/>')
                 if char.strip(): elements.append(f'<text x="{16 + xx * 9}" y="{32 + yy * 20}" font-family="Menlo,DejaVu Sans Mono,monospace" font-size="15" font-weight="{700 if bold else 400}" fill="{color}">{html.escape(char)}</text>')
         elements.append('</svg>'); (artifacts / (name + '.svg')).write_text(''.join(elements))
         if Image is not None:
-            image = Image.new('RGB', (self.cols * 9 + 32, self.rows * 20 + 32), '#111111')
+            image = Image.new('RGB', (self.cols * 9 + 32, self.rows * 20 + 32), self.background)
             draw = ImageDraw.Draw(image)
             font_path = next((p for p in ('/System/Library/Fonts/Menlo.ttc', '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf') if pathlib.Path(p).exists()), None)
             font = ImageFont.truetype(font_path, 15) if font_path else ImageFont.load_default()
@@ -140,7 +152,7 @@ class Terminal:
             emoji_font = ImageFont.truetype(str(emoji_path), 20) if emoji_path.exists() else symbol_font
             for yy, row in enumerate(grid):
                 for xx, (char, color, bold, background) in enumerate(row):
-                    if background != '#111111': draw.rectangle((16 + xx * 9, 16 + yy * 20, 25 + xx * 9, 36 + yy * 20), fill=background)
+                    if background != self.background: draw.rectangle((16 + xx * 9, 16 + yy * 20, 25 + xx * 9, 36 + yy * 20), fill=background)
                     if char.strip(): draw.text((16 + xx * 9, 16 + yy * 20), char, fill=color, font=wide_font if ord(char[0]) >= 0x2e80 and ord(char[0]) < 0x1f000 else emoji_font if ord(char[0]) >= 0x1f000 else font, embedded_color=True)
             image.save(artifacts / (name + '.png'))
         captures.append({'name': name, 'columns': self.cols, 'rows': self.rows, 'raw': name + '.ansi', 'screen': name + '.svg', 'png': name + '.png' if Image is not None else None})
@@ -149,7 +161,13 @@ class Terminal:
         if self.process.poll() is None:
             if sig: os.kill(self.process.pid, sig)
             else: self.send(data)
-        self.process.wait(timeout=5); self.pump()
+        deadline = time.monotonic() + 5
+        while self.process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.process.args, 5)
+            self.pump(min(.02, remaining))
+        self.pump()
         after = termios.tcgetattr(self.slave)
         before = list(self.original); durable_after = list(after)
         pending = getattr(termios, 'PENDIN', 0)
@@ -218,23 +236,30 @@ active = []
 with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
     root = pathlib.Path(temp).resolve(); storage = root / 'tasks space'; config = root / 'config'; env = dict(os.environ, TERM='xterm-256color', DOIN_CONFIG_DIR=str(config))
     real_curl=shutil.which('curl'); assert real_curl
-    guard_dir=root/'network-guard'; guard_dir.mkdir(); guard_log=root/'blocked-network.log'
+    guard_dir=root/'network-guard'; guard_dir.mkdir(); guard_log=root/'blocked-network.log'; browser_guard_log=root/'blocked-browser.jsonl'
     guard=guard_dir/'curl'
     guard.write_text('#!'+sys.executable+'\nimport os,sys,urllib.parse\nfrom pathlib import Path\nurls=[v for v in sys.argv[1:] if v.startswith(("http://","https://"))]\nif not urls or any(urllib.parse.urlsplit(v).hostname not in ("localhost","127.0.0.1","::1") for v in urls):\n with Path(os.environ["TUI_NETWORK_GUARD_LOG"]).open("a") as f:f.write("blocked\\n")\n sys.exit(97)\nos.execv(os.environ["TUI_REAL_CURL"],[os.environ["TUI_REAL_CURL"],*sys.argv[1:]])\n')
     guard.chmod(0o700)
-    env.update(PATH=str(guard_dir)+os.pathsep+env['PATH'],TUI_REAL_CURL=real_curl,TUI_NETWORK_GUARD_LOG=str(guard_log))
+    for executable in ('open', 'xdg-open'):
+        browser_guard=guard_dir/executable
+        browser_guard.write_text('#!'+sys.executable+'\nimport json,os,sys\nfrom pathlib import Path\nwith Path(os.environ["TUI_BROWSER_GUARD_LOG"]).open("a") as f:f.write(json.dumps({"command":Path(sys.argv[0]).name,"argv":sys.argv[1:]})+"\\n")\nsys.exit(97)\n')
+        browser_guard.chmod(0o700)
+    env.update(PATH=str(guard_dir)+os.pathsep+env['PATH'],TUI_REAL_CURL=real_curl,TUI_NETWORK_GUARD_LOG=str(guard_log),TUI_BROWSER_GUARD_LOG=str(browser_guard_log))
     denied=subprocess.run([str(guard),'--url','https://example.invalid'],env=env,capture_output=True)
     assert denied.returncode==97 and guard_log.read_text()=='blocked\n','Nonfixture denial guard failed'
+    denied_browser=subprocess.run([str(guard_dir/'open'),'https://example.invalid'],env=env,capture_output=True)
+    assert denied_browser.returncode==97 and json.loads(browser_guard_log.read_text())=={'command':'open','argv':['https://example.invalid']},'Browser denial guard failed'
     env.pop('NO_COLOR', None)
     subprocess.run([str(binary), 'init', '--storage', str(storage), '--provider', 'manual'], env=env, check=True, capture_output=True)
     taskfile = storage / 'tasks.md'
     original = '# Launch café\n\n## This week\n\n- [ ] Review migration with the operations team before the long deployment window\n  - [ ] Verify 東京 backup 🚀\n- [x] Capture baseline\n\n```markdown\n- [ ] Example only\n```\n\n## Personal\n\n- [ ] Buy groceries\n'
     taskfile.write_text(original)
     def case(name, fn):
+        if args.case and name != args.case: return
         try: fn(); cases.append({'name': name, 'passed': True})
         except Exception: cases.append({'name': name, 'passed': False, 'failure': traceback.format_exc()})
-    def start(executable=binary, custom_env=None, cols=88, rows=32):
-        terminal = Terminal(executable, custom_env or env, cols, rows); active.append(terminal); return terminal
+    def start(executable=binary, custom_env=None, cols=88, rows=32, background='#111111'):
+        terminal = Terminal(executable, custom_env or env, cols, rows, background); active.append(terminal); return terminal
     def contents(expected):
         deadline = time.monotonic() + 5
         while expected not in taskfile.read_text():
@@ -253,8 +278,8 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
             grid = screen(bytes(t.raw), t.cols, t.rows)
             for row in grid:
                 text = ''.join(cell[0] for cell in row)
-                if '[ ]' in text: assert any(cell[1] == '#d0d0d0' and cell[0].strip() for cell in row)
-                if '[x]' in text: assert any(cell[1] == '#949494' and cell[0].strip() for cell in row)
+                if '[ ]' in text: assert any(cell[1] == '#eeeeee' and cell[0].strip() for cell in row)
+                if '[x]' in text: assert any(cell[1] == '#eeeeee' and cell[0].strip() for cell in row)
             t.send('/add Review café'); t.send(b'\x1b[D\x1b[3~'); t.send('e 🚀'); t.send(b'\x7f'); t.send('東京'); t.capture('editing-unicode'); t.send('\r')
             contents('- [ ] Review cafe 東京'); t.ready()
             t.send('/note current draft'); t.send(b'\x1b[A\x1b[B\r'); contents('current draft'); t.ready()
@@ -270,6 +295,38 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
         finally: t.close(); active.remove(t)
     case('sectioned task board, Unicode editing/delete, history draft, completion, paste, resize and Ctrl+C restore', manual)
 
+    def slash_commands():
+        t = start()
+        try:
+            t.wait('Tasks   '); t.ready(); before = taskfile.read_bytes()
+            t.send('/'); t.wait('/add'); t.wait('/ask'); t.capture('slash-menu-open')
+            opened = '\n'.join(''.join(cell[0] for cell in row) for row in screen(bytes(t.raw), t.cols, t.rows))
+            assert '› /add' in opened and '/ask' in opened, 'Slash did not open selectable command rows immediately'
+            t.send(b'\x1b'); t.pump(.12); t.capture('slash-menu-dismissed')
+            dismissed = '\n'.join(''.join(cell[0] for cell in row) for row in screen(bytes(t.raw), t.cols, t.rows))
+            assert '/' in dismissed and '/add' not in dismissed, 'Escape should hide choices while preserving the slash draft'
+            t.send(b'\x7f'); offset = len(t.raw); t.send('/d'); t.wait('/done', offset); t.wait('/delete', offset); t.capture('slash-menu-filtered')
+            filtered = '\n'.join(''.join(cell[0] for cell in row) for row in screen(bytes(t.raw), t.cols, t.rows))
+            assert '/done' in filtered and '/delete' in filtered and '/add' not in filtered, 'Command choices did not filter by typed prefix'
+            t.send(b'\x1b[B'); t.pump(.2); selected = t.capture('slash-menu-arrow-selected')
+            assert '› /delete' in selected, 'Arrow keys did not move menu selection'
+            offset = len(t.raw); t.resize(42, 14); t.wait('/delete', offset); t.ready(); resized = t.capture('slash-menu-resized')
+            assert '› /delete' in resized, 'Resize lost the draft or menu selection'
+            t.send('\t'); t.pump(.2); t.capture('slash-menu-tab-completed')
+            completed = '\n'.join(''.join(cell[0] for cell in row) for row in screen(bytes(t.raw), t.cols, t.rows))
+            assert '/delete ' in completed and '/done' not in completed and taskfile.read_bytes() == before, 'Tab must fill the highlighted command, hide choices for arguments and avoid execution'
+            t.send(b'\x15'); offset = len(t.raw); t.send('/up'); t.wait('/update', offset); t.wait('/upgrade', offset); ambiguous = t.capture('slash-menu-update-upgrade')
+            assert '/update' in ambiguous and '/upgrade' in ambiguous, 'The shared command table must include all valid update commands'
+            t.send('\t'); t.pump(.2); completed_update = t.capture('slash-menu-update-tab-completed')
+            assert '/update ' in completed_update and taskfile.read_bytes() == before, 'Tab should complete the highlighted /up match without executing it'
+            t.send(b'\x15'); t.send(b'\x1b[200~pasted draft\x1b[201~'); t.pump(.2); pasted = t.capture('slash-menu-paste-remains-draft')
+            assert 'pasted draft' in pasted and taskfile.read_bytes() == before, 'Pasting ordinary text must preserve it as a draft'
+            t.send(b'\x15'); offset = len(t.raw); t.send('/help\r'); t.wait('tiny Markdown tasks', offset); t.ready(); t.capture('slash-menu-enter-exact-command')
+            assert taskfile.read_bytes() == before, 'Enter should still submit a complete typed command'
+            t.send(b'\x03'); t.finish(); assert taskfile.read_bytes() == before
+        finally: t.close(); active.remove(t)
+    case('slash menu opens immediately, dismisses without losing draft, filters and fills safely', slash_commands)
+
     def ai():
         subprocess.run([str(binary), 'init', '--storage', str(storage), '--provider', 'ollama', '--model', 'fixture-local', '--endpoint', f'http://127.0.0.1:{server.server_port}'], env=env, check=True, capture_output=True)
         t = start()
@@ -280,14 +337,14 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
             assert b'\x1b[2J' not in t.raw and b'unsafe-title' not in t.raw
             sgr = re.findall(rb'\x1b\[([0-9;]*)m', bytes(t.raw))
             assert not any(code in (b'31', b'32', b'36', b'91', b'92', b'96') for code in sgr), 'Accent palette remains'
-            assert b'\x1b[48;2;36;36;36m' in t.raw and b'User' in t.raw and b'Assistant' in t.raw, 'Neutral user band and assistant role missing'
-            assert b'\x1b[38;2;255;255;255m' in t.raw and b'\x1b[38;2;208;208;208m' in t.raw and b'\x1b[38;2;148;148;148m' in t.raw, 'User/assistant/system contrast hierarchy missing'
+            assert b'\x1b[7m' not in t.raw and re.search(rb'\x1b\[48;2;\d+;\d+;\d+m', bytes(t.raw)) and b'User' in t.raw and b'Assistant' in t.raw, 'Soft accent user band and assistant role missing'
+            assert b'\x1b[39m' in t.raw and b'\x1b[38;2;255;255;255m' not in t.raw and b'\x1b[38;2;208;208;208m' not in t.raw and b'\x1b[38;2;148;148;148m' not in t.raw, 'Foreground should follow the terminal theme'
             conversation = t.capture('neutral-conversation')
             assert conversation.count('What should I do first?') == 1, 'Submitted composer duplicates user turn'
             grid = screen(bytes(t.raw), t.cols, t.rows)
             user_row = next(i for i, row in enumerate(grid) if 'User  What should I do first?' in ''.join(cell[0] for cell in row))
             for row in (grid[user_row - 1], grid[user_row + 1]):
-                assert not ''.join(cell[0] for cell in row).strip() and sum(cell[3] == '#242424' for cell in row) >= t.cols - 5, 'Gray vertical padding missing'
+                assert not ''.join(cell[0] for cell in row).strip() and len({cell[3] for cell in row if cell[3] != '#111111'}) == 1, 'Soft accent vertical padding missing'
             for cols,rows in [(52,20),(100,30),(62,24)]:
                 offset=len(t.raw);t.resize(cols,rows);t.wait('Enter submit',offset);t.ready()
                 resized=t.capture(f'ai-response-resize-{cols}')
@@ -301,6 +358,40 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
             contents('## Weekend plan'); t.ready(); t.capture('ai-saved'); t.finish(b'\x04')
         finally: t.close(); active.remove(t)
     case('natural-language question is read-only; AI plan preview rejects/accepts; terminal output sanitized; Ctrl+D restore', ai)
+
+    def ai_user_message_theme():
+        custom = dict(env, DOIN_CONFIG_DIR=str(root / 'ai-message-theme-config'))
+        subprocess.run([str(binary), 'init', '--storage', str(storage), '--provider', 'ollama', '--model', 'fixture-local', '--endpoint', f'http://127.0.0.1:{server.server_port}'], env=custom, check=True, capture_output=True)
+        pathlib.Path(custom['DOIN_CONFIG_DIR'], 'theme-local.json').write_text('{"accent":"#AF52DE"}')
+        for name, background in [('dark', '#111111'), ('light', '#f4f4f4')]:
+            t = start(custom_env=custom, cols=48, rows=22, background=background)
+            try:
+                t.wait('Tasks   '); t.ready(); offset = len(t.raw)
+                t.send('What should I do first about this wrapped 東京 🚀 message with enough words to span several terminal rows?\r')
+                t.wait('Review migration before launch', offset); t.ready()
+                capture = t.capture(f'ai-user-message-theme-{name}')
+                grid = screen(bytes(t.raw), t.cols, t.rows, t.foreground, t.background)
+                user_row = next(i for i, row in enumerate(grid) if 'User  What should I do first' in ''.join(cell[0] for cell in row))
+                nearby = grid[user_row - 1:user_row + 6]
+                user_backgrounds = {cell[3] for row in nearby for cell in row if cell[3] != background}
+                assert len(user_backgrounds) == 1, 'User message and padding should share one soft fill on dark and light terminals'
+                fill = next(iter(user_backgrounds))
+                rgb = tuple(int(fill[index:index + 2], 16) for index in (1, 3, 5))
+                assert rgb[2] > rgb[0] > rgb[1], 'User message fill should retain the cached Grape Soda hue'
+                def luminance(color):
+                    channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+                    linear = [channel / 12.92 if channel <= .04045 else ((channel + .055) / 1.055) ** 2.4 for channel in channels]
+                    return sum(value * weight for value, weight in zip(linear, (.2126, .7152, .0722)))
+                text_cells = [cell for row in nearby for cell in row if cell[3] == fill and cell[0].strip()]
+                assert text_cells and all((max(luminance(cell[1]), luminance(cell[3])) + .05) / (min(luminance(cell[1]), luminance(cell[3])) + .05) >= 4.5 for cell in text_cells), 'User message text should keep readable contrast'
+                padding_rows = [row for row in nearby if not ''.join(cell[0] for cell in row).strip() and sum(cell[3] == fill for cell in row) >= t.cols - 5]
+                assert len(padding_rows) >= 2, 'Top and bottom padding should span the same colored band'
+                assert not (background == '#111111' and fill == '#ffffff'), 'Dark terminal padding should not fall back to stark white'
+                assert '東京' in capture and '🚀' in capture and re.search(rb'\x1b\[48;2;\d+;\d+;\d+m', bytes(t.raw)[offset:]), 'Wrapped Unicode turn should render on a soft accent fill'
+                assert b'\x1b[7m' not in bytes(t.raw)[offset:], 'User-message band should not use inverse video'
+                t.finish()
+            finally: t.close(); active.remove(t)
+    case('AI user message uses cached accent with readable fill across dark/light terminals and wrapped Unicode', ai_user_message_theme)
 
     def model_picker():
         custom = dict(env, DOIN_CONFIG_DIR=str(root / 'picker-config'))
@@ -451,7 +542,7 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
             first = t.capture('storage-recommended-default')
             assert '› 1' in first and '(Recommended)' in first and 'Documents/doin' in first
             t.send('\r'); t.wait('How would you like to organize'); t.ready(); t.send('\r')
-            t.wait('How would you like your AI?'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            t.wait('accent color'); t.ready(); t.send('\r'); t.wait('How would you like your AI?'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
             settings = json.loads((root / 'default-storage' / 'config.json').read_text())
             assert settings['storage'] == str(fakehome / 'Documents' / 'doin')
             assert (folder_log.read_bytes() if folder_log.exists() else b'') == before
@@ -463,10 +554,10 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
             t.wait('Select a folder'); t.ready(); t.send('\x1b[B\r')
             t.wait('Use this folder'); t.ready(); t.send(b'\x1b'); t.pump(.2)
             cancelled = t.capture('storage-picker-cancelled')
-            assert 'Select a folder' in cancelled and not (root / 'cancel-storage' / 'config.json').exists()
+            assert 'Select a folder' in cancelled and 'Choose a folder' not in cancelled and not (root / 'cancel-storage' / 'config.json').exists()
             t.send('\x1b[B\r'); t.wait('Use this folder'); t.ready(); t.send('Documents\r'); t.pump(.2); t.send('\r')
             t.wait('How would you like to organize'); t.ready(); t.send('\r')
-            t.wait('How would you like your AI?'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            t.wait('accent color'); t.ready(); t.send('\r'); t.wait('How would you like your AI?'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
             assert json.loads((root / 'cancel-storage' / 'config.json').read_text())['storage'] == str(chosen)
             assert (folder_log.read_bytes() if folder_log.exists() else b'') == before
             t.capture('storage-picker-selected-unicode'); t.finish()
@@ -478,71 +569,219 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
         vanished = documents / 'Alpha vanished'; vanished.mkdir()
         target = documents / 'Beta café project'; target.mkdir()
         (documents / 'Gamma link').symlink_to(target, target_is_directory=True)
-        for i in range(24): (documents / f'Project {i:02}').mkdir()
+        for i in range(55): (documents / f'Project {i:02}').mkdir()
         (home / 'Downloads').mkdir()
         (documents / '2026 Roadmap').mkdir()
         custom = onboarding_env('browser-storage', target); custom['HOME'] = str(home)
-        t = start(custom_env=custom, cols=76, rows=20)
+        def assert_browser_frame(t, capture, path_fragment, use_visible=False):
+            grid=screen(bytes(t.raw),t.cols,t.rows,t.foreground,t.background)
+            rows=[''.join(cell[0] for cell in row).rstrip() for row in grid]
+            question=[i for i,line in enumerate(rows) if 'Choose a folder' in line]
+            top=[i for i,line in enumerate(rows) if '╭' in line]
+            bottom=[i for i,line in enumerate(rows) if '╰' in line]
+            assert len(question)==1 and top==question and len(bottom)==1 and bottom[0]==top[0]+10, (question,top,bottom,rows)
+            assert sum('Choose a folder' in line for line in rows)==1 and rows[top[0]+1].count('│')==2, rows
+            assert rows[bottom[0]+2].startswith('  Path: ') and rows[bottom[0]+3].startswith('  Filter: ') and rows[bottom[0]+4].find('↑↓')>=0, rows
+            frame='\n'.join(rows)
+            assert frame.count(path_fragment)==1, ('current path must appear once',path_fragment,frame)
+            if use_visible: assert frame.count('Use this folder')==1, frame
+            assert len(rows[top[0]+2:bottom[0]])==8, ('directory list must reserve eight answer rows',rows)
+        t = start(custom_env=custom, cols=80, rows=24)
         try:
             t.wait('Select a folder'); t.ready(); t.send('\x1b[B\r'); t.wait('Downloads'); t.ready()
-            t.capture('storage-browser-home'); t.send('Documents\x1b[C'); t.pump(.2); t.ready()
-            t.wait('Alpha vanished'); t.capture('storage-browser-initial')
+            home_screen=t.capture('storage-browser-home'); assert_browser_frame(t,home_screen,'browser home',True)
+            t.send('Documents\x1b[C'); t.pump(.2); t.ready()
+            t.wait('Alpha vanished'); initial=t.capture('storage-browser-initial'); assert_browser_frame(t,initial,'Documents',True)
+            # Repeated filters and navigation must redraw in place without growing the picker.
+            t.send('Project'); t.pump(.2); t.send(' 0'); t.pump(.2)
+            filtered=t.capture('storage-browser-filter-typed'); assert_browser_frame(t,filtered,'Documents'); assert 'Project 0' in filtered
+            t.send('1'); t.pump(.2); t.send('\x7f'); t.pump(.2); t.send('2'); t.pump(.2)
+            t.capture('storage-browser-filter-edited'); t.send('\x15'); t.pump(.2)
+            t.send('\x1b[B'*45); t.ready(); scrolled80=t.capture('storage-browser-many-options-80'); assert_browser_frame(t,scrolled80,'Documents')
+            t.resize(103,42); t.pump(.3); t.ready(); t.send('\x1b[B'*16); t.ready()
+            scrolled103=t.capture('storage-browser-many-options-103'); assert_browser_frame(t,scrolled103,'Documents')
+            t.send('\x1b[1;3D'); t.pump(.2); t.ready(); home_again=t.capture('storage-browser-history-back'); assert_browser_frame(t,home_again,'browser home')
+            t.send('\x1b[1;3C'); t.pump(.2); t.ready(); docs_again=t.capture('storage-browser-history-forward'); assert_browser_frame(t,docs_again,'Documents')
             t.send('Alpha'); t.pump(.2); vanished.rmdir(); t.send('\r'); t.wait('Cannot open'); t.ready()
             t.capture('storage-browser-recovered'); t.send('\x15No such folder\r'); t.pump(.2)
             assert not (root / 'browser-storage' / 'config.json').exists()
-            t.capture('storage-browser-no-match'); t.send('\x15Gamma'); t.pump(.2); t.resize(48,14); t.pump(.3); t.ready()
+            no_match=t.capture('storage-browser-no-match'); assert_browser_frame(t,no_match,'Documents')
+            t.send('\x15Gamma'); t.pump(.2); t.resize(48,14); t.pump(.3); t.ready()
             resized=t.capture('storage-browser-filter-resized'); assert 'Gamma' in resized
-            t.send('\r'); t.pump(.2); t.ready(); t.capture('storage-browser-symlink')
+            t.send('\r'); t.pump(.2); t.ready(); symlink=t.capture('storage-browser-symlink'); assert 'Gamma link' in symlink and symlink.count('Use this folder')==1
             t.send('\x1b[1;3D'); t.pump(.2); t.ready(); t.send('\x1b[1;3C'); t.pump(.2); t.ready()
             t.send('\x1b[D'); t.pump(.2); t.ready(); t.send('2026x\x7f\r'); t.pump(.2); t.ready(); t.send('\x1b[D'); t.pump(.2); t.ready(); t.send('Beta\r'); t.pump(.2); t.ready(); t.send('\r')
             t.wait('How would you like to organize'); t.ready(); t.send('\r')
-            t.wait('How would you like your AI?'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            t.wait('accent color'); t.ready(); t.send('\r'); t.wait('How would you like your AI?'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
             settings = json.loads((root / 'browser-storage' / 'config.json').read_text())
             assert settings['storage'] == str(target.resolve())
             t.finish()
         finally: t.close(); active.remove(t)
-    case('terminal browser filters, navigates history and symlinks, handles vanished folders and resizes without committing', storage_browser_fallback)
+    case('directory browser keeps a fixed eight-row box at 80x24 and 103x42, filters and navigates history without duplicate path rows or premature commit', storage_browser_fallback)
+
+    def assert_picker_box_layout(t, capture, question, first_choice, neutral=True):
+        lines=capture.splitlines(); question_row=next(i for i,line in enumerate(lines) if question in line); top=next(i for i,line in enumerate(lines) if '╭' in line); first=next(i for i,line in enumerate(lines) if first_choice in line); bottom=next(i for i,line in enumerate(lines) if '╰' in line); hint=next(i for i,line in enumerate(lines) if '↑↓ choose' in line)
+        assert top == question_row and top + 2 <= first < bottom and bottom == top + 10 and hint == bottom + 3, (question_row, top, first, bottom, hint)
+        assert '│' in lines[top + 1] and '›' not in lines[top + 1], ('one blank answer row should separate the question from choices', lines[top + 1])
+        spacer=''.join(cell[0] for cell in screen(bytes(t.raw), t.cols, t.rows, t.foreground, t.background)[top + 1])
+        top_cells=''.join(cell[0] for cell in screen(bytes(t.raw), t.cols, t.rows, t.foreground, t.background)[top])
+        bottom_cells=''.join(cell[0] for cell in screen(bytes(t.raw), t.cols, t.rows, t.foreground, t.background)[bottom])
+        frame_right=top_cells.index('╮'); spacer_right=spacer.rindex('│'); bottom_right=bottom_cells.index('╯')
+        assert spacer_right == frame_right == bottom_right, ('spacer row must keep the frame border aligned', frame_right, spacer_right, bottom_right)
+        assert capture.count(question) == 1, ('question must stay on the top border once', capture)
+        grid=screen(bytes(t.raw), t.cols, t.rows, t.foreground, t.background)
+        question_cells=grid[question_row]
+        assert '╭' in ''.join(cell[0] for cell in question_cells) and any(cell[2] for cell in question_cells if cell[0].strip() and cell[0] not in ('╭','─','╮')), ('question must be bold inside the top border', question_cells)
+        selected=next(row for row in grid if '›' in ''.join(cell[0] for cell in row))
+        text=''.join(cell[0] for cell in selected); chevron=selected[text.index('›')]; label=selected[text.index('›')+2]
+        chevron_rgb=tuple(int(chevron[1][i:i+2],16) for i in (1,3,5)); background_rgb=tuple(int(chevron[3][i:i+2],16) for i in (1,3,5))
+        def luminance(rgb):
+            channels=[channel/255 for channel in rgb]
+            channels=[value/12.92 if value<=0.04045 else ((value+0.055)/1.055)**2.4 for value in channels]
+            return sum(channel*weight for channel,weight in zip(channels,(0.2126,0.7152,0.0722)))
+        contrast=(max(luminance(chevron_rgb),luminance(background_rgb))+0.05)/(min(luminance(chevron_rgb),luminance(background_rgb))+0.05)
+        assert chevron[1] != label[1] and label[1] == t.foreground, ('selected label must keep default foreground', chevron, label)
+        label_rgb=tuple(int(label[1][i:i+2],16) for i in (1,3,5)); text_contrast=(max(luminance(label_rgb),luminance(background_rgb))+0.05)/(min(luminance(label_rgb),luminance(background_rgb))+0.05)
+        assert chevron[3] != t.background and contrast >= 3.2, ('selected row must use a dim primary background and contrasting chevron', chevron, contrast)
+        assert text_contrast >= 4.5, ('selected label must meet readable contrast against its row background', label, chevron, text_contrast)
+        if neutral: assert chevron_rgb[0] == chevron_rgb[1] == chevron_rgb[2] and background_rgb[0] == background_rgb[1] == background_rgb[2], ('default theme selection must use neutral gray', chevron)
 
     def onboarding():
         custom = onboarding_env('onboarding', root / 'onboarded tasks')
         t = start(custom_env=custom, cols=70, rows=28)
         try:
-            t.wait('Select a folder'); t.ready(); onboarding_screen=t.capture('onboarding-bottom-composer'); assert '╭' in onboarding_screen.splitlines()[-4]; storage_choice(t); t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\r'); t.wait('Manual (Recommended) — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
-            assert b'1 \x1b[2m/\x1b[0m Where should your markdown live?' in t.raw
-            assert b'2 \x1b[2m/\x1b[0m How would you like to organize your tasks?' in t.raw
-            assert b'3 \x1b[2m/\x1b[0m How would you like your AI?' in t.raw
+            t.wait('Select a folder'); t.ready(); onboarding_screen=t.capture('onboarding-first-step'); assert '1/4 Where should your markdown live?' in onboarding_screen; assert_picker_box_layout(t, onboarding_screen, '1/4 Where should your markdown live?', 'Documents/doin'); storage_choice(t); t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\r'); t.wait('accent color'); t.ready(); t.send('\r'); t.wait('ChatGPT'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            assert b'1/4 Where should your markdown live?' in t.raw
+            assert b'2/4 How would you like to organize your tasks?' in t.raw
+            assert b'4/4 How would you like your AI?' in t.raw
             settings = json.loads((root / 'onboarding' / 'config.json').read_text()); assert settings['provider'] == 'manual' and settings['storage'] == str(root / 'onboarded tasks')
             t.capture('onboarding-complete'); t.finish(sig=signal.SIGTERM)
         finally: t.close(); active.remove(t)
-    case('first-run location then model skip continues into composer; SIGTERM restores terminal', onboarding)
+    case('first-run guided setup continues into composer; SIGTERM restores terminal', onboarding)
 
     def onboarding_arrows():
         custom = onboarding_env('arrows-onboarding', root / 'areas-tasks')
-        t = start(custom_env=custom, cols=70, rows=28)
+        t = start(custom_env=custom, cols=80, rows=24)
         try:
             storage_choice(t)
             t.wait('How would you like to organize your tasks?'); t.ready()
-            initial=t.capture('onboarding-organization-recommended'); assert '› 1  Simple (Recommended) — one Markdown list' in initial
-            t.send('\x1b[B\x1b[B\r'); t.wait('Projects (Recommended) — Inbox, Projects, Archive'); t.ready()
-            t.capture('onboarding-template-recommended'); t.send('\x1b[B\r')
-            t.wait('Manual (Recommended) — no model needed'); t.ready()
-            t.send('\x1b[B\x1b[B\x1b[B'); t.pump(.2)
-            fourth=t.capture('onboarding-fourth-ai'); assert '› 4  Continue with ChatGPT' in fourth
-            t.send('\x1b[A\x1b[A\x1b[A\r'); t.wait('Tasks   '); t.ready()
+            initial=t.capture('onboarding-organization-recommended'); assert '2/4 How would you like to organize your tasks?' in initial and '› 1  Simple (Recommended) — one Markdown list' in initial and '2  Choose a template' in initial and '3  Custom — a folder and optional first task' in initial and 'Working · input resumes when ready' not in initial
+            assert initial.index('› 1  Simple (Recommended)') < initial.index('2  Choose a template') < initial.index('3  Custom — a folder'), 'organization choices must be ordered Simple, template, Custom'
+            hierarchy=screen(bytes(t.raw), t.cols, t.rows, t.foreground, t.background)
+            template_row=next(row for row in hierarchy if 'Choose a template' in ''.join(cell[0] for cell in row))
+            template_cell=template_row[''.join(cell[0] for cell in template_row).index('Choose a template')]
+            def rel_lum(color):
+                channels=[int(color[i:i+2],16)/255 for i in (1,3,5)]
+                channels=[value/12.92 if value<=0.04045 else ((value+0.055)/1.055)**2.4 for value in channels]
+                return sum(value*weight for value,weight in zip(channels,(0.2126,0.7152,0.0722)))
+            secondary_contrast=(max(rel_lum(template_cell[1]),rel_lum(t.background))+0.05)/(min(rel_lum(template_cell[1]),rel_lum(t.background))+0.05)
+            assert template_cell[1] != t.foreground and secondary_contrast >= 4.5, ('unselected choice should be secondary but readable', template_cell, secondary_contrast)
+            assert_picker_box_layout(t, initial, '2/4 How would you like to organize your tasks?', 'Simple (Recommended)')
+            t.send('\x1b[B\r'); t.wait('Projects (Recommended) — Inbox, Projects, Archive'); t.ready()
+            nested=t.capture('onboarding-template-recommended'); assert '2/4 Template for your tasks' in nested and 'Back' in nested and 'Working · input resumes when ready' not in nested
+            assert_picker_box_layout(t, nested, '2/4 Template for your tasks', 'Projects (Recommended)')
+            t.send('\x1b'); t.wait('How would you like to organize your tasks?'); t.ready(); t.capture('onboarding-template-escape-back')
+            t.send('\x1b[B\r'); t.wait('Projects (Recommended) — Inbox, Projects, Archive'); t.ready(); t.send('\x1b[B\x1b[B\r')
+            t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\x1b[B\r'); t.wait('Projects (Recommended) — Inbox, Projects, Archive'); t.ready(); t.send('\x1b[B\r')
+            t.wait('Areas — Personal, Work, Someday'); t.ready()
+            t.wait('accent color'); t.ready(); t.send('\r')
+            t.wait('How would you like your AI?'); t.ready()
+            short=t.capture('onboarding-ai-shortlist'); assert '4/4 How would you like your AI?' in short and '› 1  ChatGPT' in short and '2  Grok' in short and '3  Local with Ollama' in short and '4  More...' in short and 'Manual' not in short
+            assert_picker_box_layout(t, short, '4/4 How would you like your AI?', 'ChatGPT')
+            t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready()
+            full=t.capture('onboarding-ai-expanded'); assert '› 1  Manual — no model needed' in full and '15  Fireworks AI' not in full
+            assert_picker_box_layout(t, full, '4/4 How would you like your AI?', 'Manual')
+            t.send('\x1b[B' * 14); t.wait('15  Fireworks AI'); t.ready()
+            last_provider=t.capture('onboarding-ai-last-provider'); assert '› 15  Fireworks AI' in last_provider
+            assert_picker_box_layout(t, last_provider, '4/4 How would you like your AI?', '10  ')
+            t.send('\x1b[A' * 14); t.wait('1  Manual'); t.ready()
+            back_to_first=t.capture('onboarding-ai-back-to-first'); assert '› 1  Manual — no model needed' in back_to_first
+            t.send('\r'); t.wait('Tasks   '); t.ready()
             settings=json.loads((root / 'arrows-onboarding' / 'config.json').read_text())
             assert settings['provider']=='manual'
             names={p.parent.name for p in (root / 'areas-tasks').rglob('.doin-folder.json')}
             assert {'Personal','Work','Someday'} <= names
             t.capture('onboarding-areas-persisted'); t.finish()
         finally: t.close(); active.remove(t)
-    case('onboarding arrows choose Areas; top recommendation visible; fourth AI choice reachable without authentication', onboarding_arrows)
+    case('onboarding uses a stable answer box; template Escape and Back return; expanded providers page to the last choice and back', onboarding_arrows)
+
+
+    def onboarding_theme_preview():
+        custom = onboarding_env('theme-preview-onboarding', root / 'theme-preview-tasks')
+        t = start(custom_env=custom, cols=80, rows=24)
+        try:
+            storage_choice(t)
+            t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\r')
+            t.wait('accent color'); t.ready()
+            neutral = t.capture('onboarding-accent-neutral')
+            assert '3/4 Choose your accent color' in neutral and '› 1  Default neutral' in neutral
+            assert_picker_box_layout(t, neutral, '3/4 Choose your accent color', 'Default neutral')
+            t.send('\x1b[B'); t.ready()
+            blue = t.capture('onboarding-accent-blue-preview')
+            assert '› 2  Blueberry' in blue and '#007AFF' not in blue
+            assert_picker_box_layout(t, blue, '3/4 Choose your accent color', 'Default neutral', neutral=False)
+            grid = screen(bytes(t.raw), t.cols, t.rows, t.foreground, t.background)
+            selected = next(row for row in grid if '›' in ''.join(cell[0] for cell in row))
+            arrow = selected[next(i for i, cell in enumerate(selected) if cell[0] == '›')]
+            rgb = tuple(int(arrow[1][i:i+2], 16) for i in (1, 3, 5))
+            assert rgb[2] > rgb[0] and rgb[2] > rgb[1], ('preview should immediately apply the Blue accent to the chevron', arrow)
+            t.send('\x1b'); t.wait('How would you like to organize your tasks?'); t.ready()
+            t.send('\r'); t.wait('accent color'); t.ready(); t.send('\x1b[B\r')
+            t.wait('How would you like your AI?'); t.ready()
+            assert json.loads((root / 'theme-preview-onboarding' / 'theme-local.json').read_text())['accent'] == '#007AFF'
+            t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            assert json.loads((root / 'theme-preview-onboarding' / 'theme-local.json').read_text())['accent'] == '#007AFF'
+            t.capture('onboarding-accent-committed'); t.finish()
+        finally: t.close(); active.remove(t)
+        light_custom = onboarding_env('theme-preview-light-onboarding', root / 'theme-preview-light-tasks')
+        light = start(custom_env=light_custom, cols=80, rows=24, background='#f5f5f5')
+        try:
+            storage_choice(light)
+            light.wait('How would you like to organize your tasks?'); light.ready(); light.send('\r')
+            light.wait('accent color'); light.ready(); light.send('\x1b[B')
+            light_blue = light.capture('onboarding-accent-blue-light-preview')
+            assert_picker_box_layout(light, light_blue, '3/4 Choose your accent color', 'Default neutral', neutral=False)
+            grid = screen(bytes(light.raw), light.cols, light.rows, light.foreground, light.background)
+            selected = next(row for row in grid if '›' in ''.join(cell[0] for cell in row))
+            arrow = selected[next(i for i, cell in enumerate(selected) if cell[0] == '›')]
+            rgb = tuple(int(arrow[1][i:i+2], 16) for i in (1, 3, 5))
+            assert rgb[2] > rgb[0] and arrow[3] != light.background, ('custom accent preview stays visible on light terminals', arrow)
+            light.finish(b'\x03')
+        finally: light.close(); active.remove(light)
+    case('onboarding accent preview follows arrow selection in dark and light terminals, Escape restores, Enter commits local theme', onboarding_theme_preview)
+
+    def onboarding_light_selection():
+        custom=onboarding_env('light-terminal-onboarding', root / 'light-terminal-tasks')
+        t=start(custom_env=custom, cols=80, rows=24, background='#f5f5f5')
+        try:
+            t.wait('Select a folder'); t.ready()
+            light=t.capture('onboarding-light-selection')
+            assert_picker_box_layout(t, light, '1/4 Where should your markdown live?', 'Documents/doin')
+            t.finish(b'\x03')
+        finally: t.close(); active.remove(t)
+    case('light terminal selection uses dim neutral row, readable default text and bright neutral chevron', onboarding_light_selection)
+
+    def onboarding_template_escape_custom():
+        custom = onboarding_env('template-back-custom', root / 'template-back-tasks')
+        t = start(custom_env=custom, cols=80, rows=24)
+        try:
+            storage_choice(t)
+            t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\x1b[B\r'); t.wait('Projects (Recommended) — Inbox, Projects, Archive'); t.ready()
+            t.capture('onboarding-template-before-escape'); t.send('\x1b'); t.wait('How would you like to organize your tasks?'); t.ready()
+            t.send('\x1b[B\x1b[B\r'); t.wait('Folder name [Inbox]'); t.ready(); t.send('Studio\r'); t.wait('First task [Enter to skip]'); t.ready(); t.send('Review the launch checklist\r')
+            t.wait('accent color'); t.ready(); t.send('\r'); t.wait('How would you like your AI?'); t.ready(); t.send('\x1b[B\x1b[B\x1b[B\r'); t.wait('Manual — no model needed'); t.ready(); t.send('\r'); t.wait('Tasks   '); t.ready()
+            config=json.loads((root / 'template-back-custom' / 'config.json').read_text()); assert config['provider']=='manual' and config['storage']==str(root / 'template-back-tasks' / 'Studio')
+            assert 'Review the launch checklist' in (root / 'template-back-tasks' / 'Studio' / 'tasks.md').read_text()
+            t.capture('onboarding-template-escape-custom-complete'); t.finish()
+        finally: t.close(); active.remove(t)
+    case('template Escape returns to organization so Custom folder and first task can complete', onboarding_template_escape_custom)
 
     def onboarding_resize_cancel():
         custom = onboarding_env('resize-onboarding', root / 'resize-tasks')
         t = start(custom_env=custom, cols=70, rows=28)
         try:
             storage_choice(t)
-            t.wait('Simple (Recommended)'); t.ready(); t.resize(62, 22); t.pump(.3)
+            t.wait('Simple (Recommended)'); t.ready(); t.resize(80, 16); t.pump(.3)
             resized=t.capture('onboarding-resize-recommended'); assert '› 1  Simple (Recommended)' in resized
             assert not (root / 'resize-onboarding' / 'config.json').exists()
             t.finish(sig=signal.SIGINT)
@@ -556,6 +795,7 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
         t = start(custom_env=custom, cols=76, rows=16)
         try:
             t.ready(); t.send('/provider\r'); t.wait('AI provider'); t.ready()
+            t.send('\x1b[B' * 3 + '\r'); t.wait('Manual — no model needed'); t.ready()
             t.send('\x1b[B' * 14); t.pump(.2)
             last = t.capture('provider-menu-last-option-short')
             assert '› 15  Fireworks AI' in last
@@ -577,10 +817,12 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
         t = start(custom_env=custom)
         try:
             storage_choice(t)
-            t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\r'); t.wait('Manual (Recommended) — no model needed'); t.ready(); t.send('\x1b[B\r'); t.wait('API base URL'); t.ready()
-            t.send(f'http://127.0.0.1:{server.server_port}\r'); t.wait('fixture-local'); t.ready()
+            t.wait('How would you like to organize your tasks?'); t.ready(); t.send('\r'); t.wait('accent color'); t.ready(); t.send('\r'); t.wait('Local with Ollama'); t.ready(); t.send('3\r'); t.wait('API base URL'); t.ready()
+            t.send(f'http://127.0.0.1:{server.server_port}\r'); t.wait('Choose a model'); t.wait('fixture-local'); t.ready()
             assert b'\x1b[2J' not in t.raw and b'local-catalog-title' not in t.raw
-            t.send('fixture-local\r'); t.wait('Tasks   '); t.ready(); t.capture('local-catalog-sanitized'); t.finish()
+            t.send('1\r'); t.wait('Tasks   '); t.ready()
+            saved=json.loads((root / 'local-onboarding' / 'config.json').read_text()); assert saved['provider']=='ollama' and saved['model']=='fixture-local'
+            t.capture('local-catalog-sanitized'); t.finish()
         finally: t.close(); active.remove(t)
     case('local model catalog control sequences cannot clear the actual PTY or change its title', local_catalog)
 
@@ -744,12 +986,15 @@ with tempfile.TemporaryDirectory(prefix='doin-tui-e2e-') as temp:
     case('NO_COLOR, dumb narrow terminal, and piped CLI output remain plain', plain)
     def network_boundary():
         assert guard_log.read_text()=="blocked\n", "Application attempted external network"
-    case("network guard rejects nonfixture URLs before execution and no application case attempts external access",network_boundary)
+        browser_attempts=[json.loads(line) for line in browser_guard_log.read_text().splitlines()]
+        assert browser_attempts==[{'command':'open','argv':['https://example.invalid']}], "An application case attempted to launch a real browser"
+    case("network and browser guards reject nonfixture destinations; app cases make no unexpected browser attempts",network_boundary)
     for terminal in active: terminal.close()
 server.shutdown(); server.server_close(); thread.join(timeout=5)
 report = {'binary': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'binary_bytes': binary.stat().st_size, 'cases': cases, 'captures': captures, 'requests': requests, 'service_calls': service_calls, 'terminal_restorations': restorations}
 (artifacts / 'results.json').write_text(json.dumps(report, indent=2))
 (artifacts / 'README.md').write_text('# Real PTY evidence\n\nRun `python3 tests/tui_e2e.py --bin zig-out/bin/doin`. SVG files render the screen decoded from each raw ANSI transcript; text files contain the same screen cells. No screenshots are fabricated from layout code. Provider/microphone fixtures test adapters, not real account consent or microphone capture.\n\n' + '\n'.join(f"- [{c['name']}]({c['screen']}) at {c['columns']} columns × {c['rows']} rows." for c in captures) + '\n')
 for c in cases: print(('PASS ' if c['passed'] else 'FAIL ') + c['name'])
+if args.case and not cases: raise SystemExit(f'No E2E case named {args.case!r}')
 print(f'Binary: {binary.stat().st_size} bytes; evidence: {artifacts}')
 raise SystemExit(0 if all(c['passed'] for c in cases) else 1)

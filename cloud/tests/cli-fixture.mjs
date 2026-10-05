@@ -61,6 +61,7 @@ try {
   await db.exec((await readFile(new URL('migrations/0007.sql', root), 'utf8')).replaceAll('\n', ' '));
   await db.exec((await readFile(new URL('migrations/0008.sql', root), 'utf8')).replaceAll('\n', ' '));
   await db.exec((await readFile(new URL('migrations/0009.sql', root), 'utf8')).replaceAll('\n', ' '));
+  await db.exec((await readFile(new URL('migrations/0010.sql', root), 'utf8')).replaceAll('\n', ' '));
   const now = Math.floor(Date.now() / 1000);
   await db.batch([
     db.prepare('INSERT INTO accounts(id,identity_key,email,name,customer_id,created_at) VALUES(?,?,?,?,?,?)').bind('fixture-account', '101', 'fixture@example.com', 'E2E', 'cus_fixture', now),

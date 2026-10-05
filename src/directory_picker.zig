@@ -48,14 +48,15 @@ pub fn browser(a: A, start: []const u8) !?[]const u8 {
             return null;
         };
         var options: std.ArrayList(terminal.ModelOption) = .empty;
-        try options.append(scratch, .{ .value = "select", .label = "Use this folder", .detail = current });
+        try options.append(scratch, .{ .value = "select", .label = "Use this folder", .detail = "Keep this location" });
         if (std.fs.path.dirname(current)) |parent| try options.append(scratch, .{ .value = parent, .label = "..", .detail = "Parent folder" });
         for (entries) |entry| try options.append(scratch, .{ .value = entry.path, .label = entry.label, .detail = "Folder" });
-        const result = terminal.modelPick(scratch, .{ .name = current, .prefix = "", .suffix = "", .placeholder = "Type to filter folders", .options = options.items, .explanation = "↑↓ move · →/Enter open · ← parent · Alt+←/→ history · Esc cancel", .selection_only = true, .directory_mode = true, .directory_state = &state }) catch |err| {
+        const result = terminal.modelPick(scratch, .{ .name = "Choose a folder", .prefix = "", .suffix = "", .placeholder = "Type to filter folders", .options = options.items, .explanation = "↑↓ select · Enter use/open · → open · ← parent · Alt←/→ history · Esc back", .selection_only = true, .escape_back = true, .directory_mode = true, .directory_path = current, .directory_state = &state }) catch |err| {
             if (err == error.PickerResized or err == error.InvalidModelChoice) continue;
             if (err == error.PickerCancelled) return null;
             return err;
         };
+        if (result.back) return null;
         if (result.navigation == .back or result.navigation == .forward) {
             const next = if (result.navigation == .back) index -| 1 else @min(index + 1, history.items.len - 1);
             if (next != index) {

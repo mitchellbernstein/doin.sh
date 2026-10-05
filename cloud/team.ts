@@ -1,6 +1,6 @@
 import {foldersRoute,folderAccess,documentRead,documentWrite} from './folders';
 import {COMMERCIAL_TERMS,COMMERCIAL_TERMS_VERSION,issueLicense,selfHostLicense,type LicenseEnv} from './license';
-export type TeamEnv=LicenseEnv&{DB:D1Database;ORIGIN:string;STRIPE_TEAM_PRICE_ID?:string;EMAIL_FROM:string;EMAIL:{send(message:{to:string;from:string;subject:string;text:string}):Promise<unknown>}};
+export type TeamEnv=LicenseEnv&{DB:D1Database;ORIGIN:string;STRIPE_TEAM_PRICE_ID?:string;STRIPE_PRICE_ID?:string;STRIPE_MONTHLY_PRICE_ID?:string;STRIPE_YEARLY_PRICE_ID?:string;EMAIL_FROM:string;EMAIL:{send(message:{to:string;from:string;subject:string;text:string}):Promise<unknown>}};
 type Actor={id:string;email:string;closing_at:number|null};
 export type Team={id:string;name:string;legal_entity:string;terms_version:string;deployment:string;customer_id:string|null;subscription_id:string|null;capacity:number;period_end:number;next_capacity:number;closing_at:number|null};
 type Boundary={body:(r:Request,max?:number)=>Promise<any>;stripe?:(path:string,fields?:Record<string,string>,key?:string,method?:'DELETE')=>Promise<any>;emailAddress?:(value:unknown)=>string};
@@ -59,6 +59,7 @@ async function lockValid(env:TeamEnv,id:string,lock:string){if(!await env.DB.pre
 async function audit(env:TeamEnv,id:string,actor:string,action:string,target=''){await env.DB.prepare('INSERT INTO team_audit VALUES(?,?,?,?,?,?)').bind(random(),id,actor,action,target,now()).run();}
 const owner=(role:string)=>{if(role!=='owner')fail(403,'team_owner_required');},admin=(role:string)=>{if(!['owner','admin'].includes(role))fail(403,'team_admin_required');};
 function paymentUrl(value:unknown){if(typeof value!=='string'||value.length>4096)fail(503,'team_billing_unavailable');let u:URL;try{u=new URL(value);}catch{fail(503,'team_billing_unavailable');}if(u.protocol!=='https:'||u.hostname!=='checkout.stripe.com'||u.username||u.password||u.port)fail(503,'team_billing_unavailable');return value;}
+function billingPortalUrl(value:unknown){if(typeof value!=='string'||value.length>4096)fail(503,'team_billing_unavailable');let u:URL;try{u=new URL(value);}catch{fail(503,'team_billing_unavailable');}if(u.protocol!=='https:'||u.hostname!=='billing.stripe.com'||u.username||u.password||u.port)fail(503,'team_billing_unavailable');return u.href;}
 async function price(env:TeamEnv,b:Boundary){if(!configured(env.STRIPE_TEAM_PRICE_ID))fail(503,'team_billing_not_configured');const p=await client(env,b)(`prices/${encodeURIComponent(env.STRIPE_TEAM_PRICE_ID!)}`);if(p.id!==env.STRIPE_TEAM_PRICE_ID||p.active!==true||p.unit_amount!==9900||p.currency!=='usd'||p.recurring?.interval!=='year'||p.recurring.interval_count!==1||p.recurring.usage_type!=='licensed')fail(503,'team_price_mismatch');}
 function checkoutFields(env:TeamEnv,t:Team,c:any){return {customer:t.customer_id!,mode:'subscription','line_items[0][price]':c.price_id,'line_items[0][quantity]':String(c.seats),'subscription_data[metadata][team_id]':t.id,'subscription_data[metadata][terms_version]':t.terms_version,success_url:`${env.ORIGIN}/team/payment?status=success`,cancel_url:`${env.ORIGIN}/team/payment?status=canceled`,expires_at:String(c.expires_at)};}
 async function restoreCheckout(env:TeamEnv,t:Team,c:any,b:Boundary){const api=client(env,b);return c.session_id?api(`checkout/sessions/${encodeURIComponent(c.session_id)}`):api('checkout/sessions',checkoutFields(env,t,c),c.idempotency_key);}
@@ -127,6 +128,35 @@ export async function teamRoute(request:Request,env:TeamEnv,actor:Actor,b:Bounda
  if((action==='document'||action==='export')&&method==='GET')return json(await documentRead(env,id,actor.id,'root'));
  if(action==='document'&&method==='PUT'){await teamAccess(env,actor.id,id,true,b);await folderAccess(env,id,actor.id,'root',true);const d=await b.body(request,1048576);return json(await documentWrite(env,id,actor.id,'root',d.revision,d.content));}
  if(action==='billing'&&method==='GET'){owner(m.role);const p=await provider(env,m,b);return json({active:p.active,paid_seats:p.capacity,next_renewal_seats:p.subscription?.items.data[0].quantity??p.capacity,current_period_end:p.period_end,status:env.SELF_HOST_MODE==='commercial'?'licensed':p.subscription?.status??'none',cancel_at_period_end:p.subscription?.cancel_at_period_end??false,occupied_seats:(await env.DB.prepare('SELECT count(*) AS n FROM team_members WHERE team_id=?').bind(id).first<{n:number}>())!.n,pending_update:!!p.subscription?.pending_update});}
+ if(action==='portal'&&method==='POST'){
+  owner(m.role);if(!m.customer_id)fail(409,'no_team_billing_customer');
+  const returnUrl=`${env.ORIGIN}/account`,portal=await api('billing_portal/sessions',{customer:m.customer_id,return_url:returnUrl,'flow_data[type]':'payment_method_update','flow_data[after_completion][type]':'redirect','flow_data[after_completion][redirect][return_url]':returnUrl});
+  if(portal.customer!==m.customer_id)fail(503,'team_billing_unavailable');return json({url:billingPortalUrl(portal.url)});
+ }
+ if(action==='personal-renewal/cancel'&&method==='POST'){
+  owner(m.role);const d=await b.body(request);if(d.confirmation!=='cancel personal renewal'||Object.keys(d).some(key=>key!=='confirmation'))fail(400,'personal_renewal_confirmation_required');
+  return lease(env,m,actor.id,async()=>{
+   const paid=await teamAccess(env,actor.id,id,true,b);if(!paid.active)fail(402,'team_subscription_required');
+   const account=await env.DB.prepare('SELECT customer_id FROM accounts WHERE id=? AND closing_at IS NULL').bind(actor.id).first<{customer_id:string|null}>();if(!account?.customer_id)fail(409,'no_personal_subscription');
+   const personalLock=random(),claimed=await env.DB.prepare('UPDATE accounts SET billing_lock=?,billing_lock_until=? WHERE id=? AND closing_at IS NULL AND (billing_lock_until IS NULL OR billing_lock_until<=?) RETURNING id').bind(personalLock,now()+120,actor.id,now()).first();if(!claimed)fail(409,'billing_busy');
+   try{
+    const renewed=await env.DB.prepare('UPDATE accounts SET billing_lock_until=? WHERE id=? AND billing_lock=? AND billing_lock_until>? RETURNING id').bind(now()+120,actor.id,personalLock,now()).first();if(!renewed)fail(409,'billing_busy');
+    const stillPaid=await teamAccess(env,actor.id,id,true,b);if(!stillPaid.active)fail(402,'team_subscription_required');
+    const response=await api(`subscriptions?customer=${encodeURIComponent(account.customer_id)}&status=all&limit=100`);
+    if(!Array.isArray(response.data)||response.has_more!==false)fail(503,'team_billing_unavailable');
+    const accepted=[env.STRIPE_PRICE_ID,env.STRIPE_MONTHLY_PRICE_ID,env.STRIPE_YEARLY_PRICE_ID].filter(configured),owned=response.data.filter((s:any)=>s.customer===account.customer_id&&s.items?.data?.some((item:any)=>accepted.includes(item.price?.id))&&!['canceled','incomplete_expired'].includes(s.status));
+    if(owned.length>1)fail(409,'multiple_personal_subscriptions');
+    const subscription=owned[0],items=subscription?.items?.data?.filter((item:any)=>accepted.includes(item.price?.id))??[];
+    if(!subscription||subscription.status!=='active'||items.length!==1||subscription.items.data.length!==1||typeof subscription.id!=='string'||!/^sub_/.test(subscription.id)||items[0].current_period_end<=now())fail(409,'no_active_personal_subscription');
+    if(subscription.pending_update)fail(409,'personal_change_pending');
+    if(subscription.cancel_at_period_end)return json({cancel_at_period_end:true,status:subscription.status,current_period_end:items[0].current_period_end});
+    const changed=await api(`subscriptions/${encodeURIComponent(subscription.id)}`,{cancel_at_period_end:'true'},`doin-team-personal-renewal-${id}-${subscription.id}-${random()}`);
+    if(changed.id!==subscription.id||changed.customer!==account.customer_id||changed.cancel_at_period_end!==true||changed.status!=='active')fail(503,'team_billing_unavailable');
+    await audit(env,id,actor.id,'cancel_personal_renewal',subscription.id);
+    return json({cancel_at_period_end:true,status:changed.status,current_period_end:items[0].current_period_end});
+   }finally{await env.DB.prepare('UPDATE accounts SET billing_lock=NULL,billing_lock_until=NULL WHERE id=? AND billing_lock=?').bind(actor.id,personalLock).run();}
+  });
+ }
  if(action==='recover'&&method==='POST'){owner(m.role);const p=await provider(env,m,b);const invoiceId=p.subscription?.latest_invoice;if(typeof invoiceId!=='string'||!/^in_/.test(invoiceId))fail(409,'no_team_payment_to_recover');const invoice=await api(`invoices/${encodeURIComponent(invoiceId)}`);if(invoice.customer!==m.customer_id||invoice.status!=='open'||typeof invoice.hosted_invoice_url!=='string')fail(409,'no_team_payment_to_recover');let u:URL;try{u=new URL(invoice.hosted_invoice_url);}catch{fail(503,'team_billing_unavailable');}if(u.protocol!=='https:'||u.hostname!=='invoice.stripe.com'||u.username||u.password||u.port)fail(503,'team_billing_unavailable');return json({url:invoice.hosted_invoice_url});}
  if(action==='receipt'&&method==='GET'){owner(m.role);const p=await provider(env,m,b);if(!p.active)fail(402,'team_subscription_required');if(env.SELF_HOST_MODE==='commercial')return json({receipt:env.COMMERCIAL_LICENSE_RECEIPT,environment:'live',expires_at:p.period_end});return json(await issueLicense(env,{team_id:id,legal_entity:m.legal_entity,seats:p.capacity,expires_at:p.period_end}));}
  if(action==='checkout'&&method==='POST'){

@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-import argparse,json,os,subprocess,tempfile
+import argparse,json,os,subprocess,sys,tempfile
 from pathlib import Path
 p=argparse.ArgumentParser();p.add_argument('--bin',default='zig-out/bin/doin');args=p.parse_args();binary=str(Path(args.bin).resolve());receipts=[]
 failure=None
 try:
     with tempfile.TemporaryDirectory(prefix='doin folders ') as tmp:
         base=Path(tmp).resolve();root=base/'library';config=base/'config';env={**os.environ,'DOIN_CONFIG_DIR':str(config)}
+        browser_bin=base/'browser-guard';browser_bin.mkdir();browser_log=base/'blocked-browser.jsonl'
+        for executable in ('open','xdg-open'):
+            shim=browser_bin/executable
+            shim.write_text('#!'+sys.executable+'\nimport json,os,sys\nfrom pathlib import Path\nwith Path(os.environ["FOLDERS_BROWSER_GUARD_LOG"]).open("a") as f:f.write(json.dumps({"command":Path(sys.argv[0]).name,"argv":sys.argv[1:]})+"\\n")\nsys.exit(97)\n')
+            shim.chmod(0o700)
+        env.update(PATH=str(browser_bin)+os.pathsep+env.get('PATH',''),FOLDERS_BROWSER_GUARD_LOG=str(browser_log))
+        denied=subprocess.run([str(browser_bin/'open'),'https://example.invalid'],env=env,capture_output=True)
+        assert denied.returncode==97 and json.loads(browser_log.read_text())=={'command':'open','argv':['https://example.invalid']},'Browser denial guard failed'
         def run(*cmd,ok=True):
             r=subprocess.run([binary,*cmd],env=env,text=True,capture_output=True,timeout=10)
             receipts.append({'args':cmd,'exit':r.returncode,'stdout':r.stdout,'stderr':r.stderr})
@@ -41,26 +49,31 @@ try:
         renamed=base/'original library';root.rename(renamed);root.symlink_to(base,target_is_directory=True)
         run('folder','list',ok=False)
         root.unlink();renamed.rename(root)
-        for organization,inputs,expected in [
-            ('simple','\n\n','home'),
-            ('custom','2\nLaunch café\nFirst 東京 task\n','custom'),
-            ('projects','3\n\n','projects'),
-            ('areas','3\n2\n','areas')]:
+        for organization,inputs,expected,custom_name,first_task in [
+            ('simple','\n','home',None,None),
+            ('custom','3\nLaunch café\nFirst 東京 task\n','custom','Launch café','First 東京 task'),
+            ('template-back-simple','2\n3\n1\n','home',None,None),
+            ('template-back-custom','2\n3\n3\nBack Launch\nBack path task\n','custom','Back Launch','Back path task'),
+            ('projects','2\n\n','projects',None,None),
+            ('areas','2\n2\n','areas',None,None)]:
             fresh=base/('onboarding '+organization);fresh.mkdir()
             prior=fresh/'tasks.md';prior.write_text('# Existing\n\n```markdown\n- [ ] Literal fence\n```\n')
             template_child=fresh/('Inbox' if expected=='projects' else 'Personal')
             if expected in ('projects','areas'):
                 template_child.mkdir();(template_child/'tasks.md').write_text('# Keep template child café\n')
             subconfig=base/('config '+organization)
-            response=subprocess.run([binary,'init'],input=str(fresh)+'\n'+inputs+'1\n',env={**env,'DOIN_CONFIG_DIR':str(subconfig)},text=True,capture_output=True,timeout=10)
+            response=subprocess.run([binary,'init'],input=str(fresh)+'\n'+inputs+'1\n4\n1\n',env={**env,'DOIN_CONFIG_DIR':str(subconfig)},text=True,capture_output=True,timeout=10)
             receipts.append({'organization':organization,'exit':response.returncode,'stdout':response.stdout,'stderr':response.stderr})
             assert response.returncode==0,receipts[-1]
             assert response.stdout.index('How would you like to organize your tasks?')<response.stdout.index('How would you like your AI?'),receipts[-1]
+            assert response.stdout.index('1  Simple (Recommended)')<response.stdout.index('2  Choose a template')<response.stdout.index('3  Custom — a folder'),receipts[-1]
+            if organization.startswith('template-back'):
+                assert 'Choose 1, 2, or 3.' not in response.stdout,receipts[-1]
             cfg=json.loads((subconfig/'config.json').read_text());assert cfg['library_root']==str(fresh)
             assert prior.read_text()=='# Existing\n\n```markdown\n- [ ] Literal fence\n```\n'
             if expected=='custom':
-                assert cfg['storage']==str(fresh/'Launch café')
-                assert 'First 東京 task' in (fresh/'Launch café'/'tasks.md').read_text()
+                assert cfg['storage']==str(fresh/custom_name)
+                assert first_task in (fresh/custom_name/'tasks.md').read_text()
             if expected in ('projects','areas'):
                 names=['Inbox','Projects','Archive'] if expected=='projects' else ['Personal','Work','Someday']
                 assert all((fresh/name/'tasks.md').exists() for name in names)
@@ -72,6 +85,7 @@ try:
             cfg=json.loads((subconfig/'config.json').read_text());assert cfg['storage']==str(target) and cfg['library_root'] is None
         run('folder','create',rootid,'../escape',ok=False)
         (root/'escape').symlink_to(base,target_is_directory=True);run('folder','list');assert not (base/'.doin-folder.json').exists()
+        assert [json.loads(line) for line in browser_log.read_text().splitlines()]==[{'command':'open','argv':['https://example.invalid']}],'An application case attempted to launch a real browser'
 except BaseException as exc:
     failure=repr(exc)
     raise

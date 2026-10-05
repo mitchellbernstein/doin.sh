@@ -42,6 +42,33 @@ fn random(a: A) ![]const u8 {
     const out = try a.alloc(u8, 43);
     return std.base64.url_safe_no_pad.Encoder.encode(out, &bytes);
 }
+fn isLegacyHostId(value: []const u8) bool {
+    if (value.len != 43) return false;
+    for (value) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+    }
+    return true;
+}
+fn newHostId(a: A) ![]const u8 {
+    var bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const out = try a.alloc(u8, 45);
+    @memcpy(out[0..9], "urn:uuid:");
+    const hex = "0123456789abcdef";
+    var j: usize = 9;
+    for (bytes, 0..) |byte, i| {
+        if (i == 4 or i == 6 or i == 8 or i == 10) {
+            out[j] = '-';
+            j += 1;
+        }
+        out[j] = hex[byte >> 4];
+        out[j + 1] = hex[byte & 15];
+        j += 2;
+    }
+    return out;
+}
 fn save(a: A, dir: []const u8, name: []const u8, bytes: []const u8) !void {
     try std.fs.cwd().makePath(dir);
     const p = try path(a, dir, name);
@@ -300,9 +327,17 @@ fn acquire(a: A, dir: []const u8) !std.fs.File {
 pub fn login(a: A, dir: []const u8, app_name: []const u8) !void {
     const lock = try acquire(a, dir);
     defer lock.close();
-    const host = read(a, dir, "host-id") catch |err| blk: {
+    const saved_host = read(a, dir, "host-id") catch |err| blk: {
         if (err != error.FileNotFound) return err;
-        const value = try random(a);
+        break :blk null;
+    };
+    defer if (saved_host) |value| a.free(value);
+    const host = if (saved_host) |value| if (!isLegacyHostId(value)) try a.dupe(u8, value) else blk: {
+        const replacement = try newHostId(a);
+        try save(a, dir, "host-id", replacement);
+        break :blk replacement;
+    } else blk: {
+        const value = try newHostId(a);
         try save(a, dir, "host-id", value);
         break :blk value;
     };

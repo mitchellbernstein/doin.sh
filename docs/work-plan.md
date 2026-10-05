@@ -77,12 +77,12 @@ Throughput checkpoint:
 - Shared mutable state. Root alone edits main/sync bridges. Cloud owner alone edits Worker/migrations. Native writes reuse the existing storage lock and compare-before-write guard.
 - Smallest safe decomposition. One owner per protocol module. Heavy build/test/install commands run serially.
 
-## Complete documented gaps (owner-authorized 2026-10-03)
+## Previously documented gaps (status updated 2026-10-04)
 
 Done predicate: every current gap below has implemented behavior, reproducible E2E receipts, reviewed integration, and a published/installed or deployed delivery. Environment-blocked checks remain open rather than being relabeled supported.
 
 1. Platform: Windows native adapter, ConPTY/process/privacy behavior, downloadable installer; actual Omarchy desktop acceptance and Linux arm64 execution where available.
-2. Commercial teams: annual $99/user purchased seats, entity/terms acceptance, internal commercial self-host rights, signed receipts, role/invitation/ownership/document isolation, sandbox seat billing and TUI management. Same annual unit price for small teams is the reversible default while no separate price is specified.
+2. Commercial teams: test-mode annual $99/seat billing, terms and entity acceptance, internal commercial self-host rights, signed receipts, team access controls and native management are locally implemented. Parent integration E2E results are pending. Production remains blocked: remote migrations 0005–0009 are pending, local source adds `0010.sql`, Worker deployment is pending, and no live purchase is enabled. Real Stripe sandbox checkout, hosted Checkout and 3DS remain unverified.
 3. Hosted MCP: external provider OAuth consent/refresh/revocation and separately scoped incoming task MCP OAuth with terminal grant approval.
 4. Local productivity: opt-in safe background sync; Linux user reminder scheduling; portable calendar and device-local notification receipts.
 5. AI: explicit per-tool approval with bounded provider tool loops, live SSE display without saving incomplete output.
@@ -94,7 +94,7 @@ Background-sync failure census: missing/changed credential identity, absent base
 
 ### Personal self-host boundary
 
-Personal mode is explicit deployment configuration, never enabled on the official hosted Worker. It permits only a configured owner email, rejects team features, and does not require Stripe for that owner. Failure census: missing/malformed owner configuration, alternate email enrollment, closed account entitlement, company-mode bypass, and official deployment accidentally receiving self-host flags. Verify with real Worker fixtures before release.
+Personal mode is explicit deployment configuration, never enabled on the official hosted Worker. It permits only a configured owner email, rejects team features, and does not require Stripe for that owner. Failure census: missing/malformed owner configuration, alternate email enrollment, closed account entitlement, company-mode bypass, and official deployment accidentally receiving self-host flags. Local Worker fixtures cover the personal-mode boundary; production deployment remains pending.
 
 ### Verification checkpoint: folders and completion batch
 
@@ -102,11 +102,11 @@ Native AI tools passed 16 real CLI scenarios; Responses streaming passed 12. The
 
 Folder storage uses stable IDs, a parent relation and one Markdown document per folder. Team folder grants apply to descendants; moving folders and offboarding must recompute access at each operation. Simple onboarding remains the default; Custom creates a first folder and optional task, and Templates offers Projects or Areas. Local folder and cloud ACL runtime checks remain queued while root integration proceeds.
 
-Commercial self-hosting now has a runtime receipt-verification seam, with issuer keys supplied independently of the receipt and no issuer billing secrets on a customer deployment. Personal self-hosting restricts sign-in to the configured owner and denies team routes. These new paths still require their real Worker acceptance checks.
+Commercial self-hosting has local runtime receipt verification, with issuer keys supplied independently of the receipt and no issuer billing secrets on a customer deployment. Personal self-hosting restricts sign-in to the configured owner and denies team routes. Local fixture results do not establish deployed-service behavior.
 
 The shared heavy-command lane is assigned serially by the root. The isolated Omarchy VM is stopped until the final Linux build is ready. The old published/installed v0.2.4 and hosted Worker remain the user-facing versions; this batch has not been released or deployed. Cloudflare KV authorization awaits the user's explicit security-access approval.
 
-Team sandbox catalogue created in the existing authenticated Chrome tab: product `prod_VNNKFUqT2xZZWJ`, yearly USD 9,900-cent per-user price `price_1UMca5J8ruTe6uCO8v5cTsqo`. Dashboard confirmed Sandbox and zero active subscriptions. No payment or live product created. Catalogue workflow checked against https://docs.stripe.com/products-prices/manage-prices . Worker binding is saved locally; deployment remains pending.
+Team sandbox catalogue created in the existing authenticated Chrome tab: product `prod_VNNKFUqT2xZZWJ`, yearly USD 9,900-cent per-user price `price_1UMca5J8ruTe6uCO8v5cTsqo`. Dashboard confirmed Sandbox and zero active subscriptions. No payment or live product created. Real Stripe sandbox checkout, hosted Checkout and 3DS remain unverified. The remote D1 migration listing reports 0005–0009 pending; local source adds `0010.sql`. Worker binding is saved locally; deployment remains pending. No migrations were applied.
 
 ### Properties and assignments checkpoint
 
@@ -116,7 +116,9 @@ Failure census: malformed/duplicate metadata, fenced examples, property renames 
 
 All six cloud suites passed 44 groups before assignment integration. Native folder lifecycle/escape E2E passed. New native sync/team/OAuth tests exposed signed decimal timeout formatting (`20.+000`) rejected by curl before HTTP; the timeout now formats unsigned values and those scenarios must pass before release.
 
-### Final local acceptance, before publication
+### Earlier local acceptance checkpoint, before latest billing changes
+
+The results immediately below are historical checkpoints. They do not verify the current interval-switching, team billing, browser or migration changes; use the current generated E2E receipts before claiming those checks.
 
 Native whole-library sync, folder lifecycle, team CLI (including assignees), hosted MCP client/OAuth consent and seven reminder groups pass. Properties pass seven real CLI groups/46 commands, including actual reminder recognition, multi-select preservation, destructive preview cancellation, external edits, symlink replacement and configuration changes. The 18-group TUI suite passes, including startup growth and subsequent shrink. A separate quoted-command/picker PTY fixture still requires a clean final exit receipt.
 
@@ -129,4 +131,4 @@ Cloud account8, gateway6, OAuth9, team9, team-folder5 and personal-folder8 group
 - Release37167109824 passed native behavior, five-target packaging and Windows runtime/install gates; v0.3.0 is public with five archives and checksums. Local installer five groups passed. Public installer updated ~/.local/bin/doin to0.3.0; 730184bytes and SHA25673d2bb4835f4cbcef9203032bb0880cad4920a2ac73a1ebd07a8f3d5531d55be match local verified package.
 - AGENTS guidance six groups/18commands passed; folders preserve custom guidance on rename, MCP shares the protocol, existing files remain intact and stale/symlink writes are refused.
 - Site deployment cbba3da6.doin-sh.pages.dev is live; doin.sh and exact Windows installer downloaded and checked.
-- External gates remain Cloudflare expanded KV consent/new Worker migrations+deployment, production billing, provider-approved ChatGPT consent and user microphone acceptance. Customized local AGENTS files are not cloud-synced.
+- External gates remain Cloudflare expanded KV consent, remote D1 migrations 0005–0009 and local migration 0010, Worker deployment, production Stripe catalog/secrets/webhook setup, published commercial terms, verified signing-key consistency, real Stripe sandbox/hosted Checkout/3DS acceptance, provider-approved ChatGPT consent and user microphone acceptance. Customized local AGENTS files are not cloud-synced.

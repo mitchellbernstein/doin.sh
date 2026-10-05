@@ -2,13 +2,16 @@
 """Real CLI/HTTP E2E. Failure census predates feature in docs/team-failure-census.md.
 Risk scenarios: accidental browser/checkout on decline; credentials in stdout;
 changed personal-folder mapping or symlink uploads; external edit during pull;
-stale team revisions; private receipt permissions. Fixture outbound is loopback.
+stale team revisions; private receipt permissions; plan changes without a matching quote;
+payment-pending state hidden from the user; unvalidated portal URLs; personal renewal
+canceled before an active team subscription or without explicit confirmation. Fixture outbound is loopback.
 """
 import argparse,http.server,json,os,pathlib,subprocess,tempfile,threading,traceback,shutil
 p=argparse.ArgumentParser();p.add_argument('--bin',default='zig-out/bin/doin');args=p.parse_args();binary=str(pathlib.Path(args.bin).resolve())
 checks=[];commands=[];requests=[];evidence=pathlib.Path('artifacts/team-client');evidence.mkdir(parents=True,exist_ok=True)
 class Backend(http.server.BaseHTTPRequestHandler):
  revision=0;content='# Shared\n- [ ] Team task\n';mutate=None
+ personal_cancelled=False;team_active=False;change_calls=[];portal_calls=[];personal_pending=False;stale_change=False;reprice_change=False;portal_url='https://billing.stripe.com/p/session/test_fixture'
  def log_message(self,*args):pass
  def request(self):
   assert self.headers.get('Authorization')=='Bearer fixture-team-device-token'
@@ -22,7 +25,21 @@ class Backend(http.server.BaseHTTPRequestHandler):
   elif self.path==base+'/folders/root/members':payload={'team_id':'team-fixture','folder_id':'root','members':[{'account_id':'owner','name':'Team Owner','email':'owner@example.test'},{'account_id':'member','name':'Team Member','email':'member@example.test'}]}
   elif self.path==base+'/members':payload={'members':[{'account_id':'owner','role':'owner'}]}
   elif self.path==base+'/checkout':assert body['seats']==3;payload={'url':'https://checkout.stripe.com/c/pay/teamfixture'}
-  elif self.path==base+'/billing':payload={'paid_seats':3,'next_renewal_seats':3,'occupied_seats':1,'active':True}
+  elif self.path==base+'/billing':payload={'paid_seats':3,'next_renewal_seats':3,'occupied_seats':1,'active':type(self).team_active}
+  elif self.path=='/v1/account':payload={'email':'owner@example.test','id':'owner'}
+  elif self.path=='/v1/billing' and self.command=='GET':payload={'status':'past_due' if type(self).personal_pending else 'active','cancel_at_period_end':type(self).personal_cancelled,'interval':'month','amount':1200,'currency':'usd','pending_update':type(self).personal_pending,'pending_interval':'year' if type(self).personal_pending else None}
+  elif self.path=='/v1/billing/change':
+   type(self).change_calls.append(body)
+   if 'quote_id' not in body and body['interval']=='month':payload={'changed':False,'payment_pending':False,'interval':'month','pending_interval':None}
+   elif 'quote_id' not in body:payload={'confirmation_required':True,'quote_id':'quote-fixture','amount_due':4800,'currency':'usd','interval':body['interval'],'expires_at':2000000000,'proration_date':1791111111}
+   elif type(self).stale_change:type(self).stale_change=False;status=409;payload={'error':'stale_quote'}
+   elif type(self).reprice_change:type(self).reprice_change=False;payload={'confirmation_required':True,'quote_id':'replacement-quote','amount_due':9900,'currency':'usd','interval':body['interval'],'expires_at':2000000000,'proration_date':1791111111}
+   else:type(self).personal_pending=True;payload={'changed':False,'payment_pending':True,'interval':'month','pending_interval':body['interval']}
+  elif self.path=='/v1/billing/portal' or self.path==base+'/portal':
+   type(self).portal_calls.append(self.path);payload={'url':type(self).portal_url}
+  elif self.path==base+'/personal-renewal/cancel':
+   assert body=={'confirmation':'cancel personal renewal'} and type(self).team_active
+   type(self).personal_cancelled=True;payload={'cancel_at_period_end':True}
   elif self.path==base+'/receipt':payload={'receipt':'doin-license-v1.fixture.signature','environment':'test','expires_at':2000000000}
   elif self.path in [base+'/document',base+'/folders/root/document',base+'/export']:
    if self.command=='PUT':
@@ -49,12 +66,30 @@ try:
   run('init','--storage',str(storage),'--provider','manual')
   (config/'sync.json').write_text(json.dumps({'endpoint':f'http://127.0.0.1:{server.server_port}','token':'fixture-team-device-token'}));(config/'sync.json').chmod(0o600)
   def lifecycle():
+   Backend.personal_pending=False
    before=len(requests);run('team','create',stdin='Test team\nExample LLC\nhosted\nno\n');assert not any(r['path']=='/v1/teams' and r['method']=='POST' for r in requests[before:]);assert not (config/'team.json').exists()
    run('team','create',stdin='Test team\nExample LLC\nhosted\nyes\n');assert (config/'team.json').stat().st_mode&0o777==0o600
-   before=len(requests);run('team','subscribe','3',stdin='no\n');assert not any(r['path'].endswith('/checkout') for r in requests[before:]);assert not browser.exists()
+   before=len(requests);opened=browser.read_text().splitlines() if browser.exists() else [];run('team','subscribe','3',stdin='no\n');assert not any(r['path'].endswith('/checkout') for r in requests[before:]);assert (browser.read_text().splitlines() if browser.exists() else [])==opened
    run('team','subscribe','3',stdin='yes\n');assert 'checkout.stripe.com' in browser.read_text()
+   Backend.team_active=False
+   before=len(requests);run('team','replace-personal',stdin='yes\n',ok=False);assert not any(r['path'].endswith('/personal-renewal/cancel') for r in requests[before:])
+   Backend.team_active=True # Simulate verified Stripe payment completion after checkout.
+   before=len(requests);run('team','replace-personal',stdin='no\n');assert not any(r['path'].endswith('/personal-renewal/cancel') for r in requests[before:])
+   run('team','replace-personal',stdin='yes\n');assert Backend.personal_cancelled
+   Backend.portal_url='https://billing.stripe.com/p/session/test_fixture'
+   opened=browser.read_text().splitlines();run('team','portal',stdin='yes\n');assert Backend.portal_calls[-1]=='/v1/teams/team-fixture/portal';assert browser.read_text().splitlines()==opened+['https://billing.stripe.com/p/session/test_fixture']
    run('team','folder',str(team));run('team','pull',stdin='yes\n');assert 'Team task' in (team/'tasks.md').read_text();personal_before=(storage/'tasks.md').read_text();run('add','Actual CLI team edit');assert 'Actual CLI team edit' in (team/'tasks.md').read_text();assert (storage/'tasks.md').read_text()==personal_before;run('assign','1','member');assigned=(team/'tasks.md').read_text();assert 'doin:task=' in assigned and 'member' in assigned and 'Team Member' in assigned;run('assign','1','outsider',ok=False);assert (team/'tasks.md').read_text()==assigned;run('team','push',stdin='yes\n');assert 'Actual CLI team edit' in Backend.content;run('team','personal');before=len(requests);run('assign','1','member',ok=False);assert len(requests)==before;run('add','Private CLI task');assert 'Private CLI task' in (storage/'tasks.md').read_text();assert 'Private CLI task' not in (team/'tasks.md').read_text();run('team','switch','team-fixture');assert json.loads((config/'config.json').read_text())['storage']==str(team.resolve())
    receipt=root/'receipt.txt';run('team','receipt',str(receipt));assert receipt.stat().st_mode&0o777==0o600
+  def personal_billing():
+   status=run('account','status');assert 'month' in status and 'active' in status and '$12.00 USD' in status
+   before=len(Backend.change_calls);same=run('account','change','month');assert 'already on the month interval' in same.lower() and len(Backend.change_calls)==before
+   before=len(Backend.change_calls);run('account','change','year',stdin='no\n');assert len(Backend.change_calls)==before+1 and 'quote_id' not in Backend.change_calls[-1]
+   before=len(Backend.change_calls);Backend.stale_change=True;run('account','change','year',stdin='yes\n',ok=False);assert len(Backend.change_calls)==before+2 and Backend.change_calls[-1]['quote_id']=='quote-fixture'
+   before=len(Backend.change_calls);Backend.reprice_change=True;repriced=run('account','change','year',stdin='yes\n');assert 'Charge changed. No subscription change made. Run account change again to review a fresh quote.' in repriced and len(Backend.change_calls)==before+2 and Backend.change_calls[-1]['quote_id']=='quote-fixture'
+   run('account','change','year',stdin='yes\n');assert Backend.change_calls[-1]=={'interval':'year','quote_id':'quote-fixture','confirm_amount':4800};assert 'payment pending for year interval' in run('account','status').lower()
+   before=len(Backend.portal_calls);run('account','portal',stdin='yes\n');assert len(Backend.portal_calls)==before+1 and Backend.portal_calls[-1]=='/v1/billing/portal';assert 'billing.stripe.com' in browser.read_text()
+   opened=browser.read_text().splitlines();Backend.portal_url='https://user:pass@billing.stripe.com/p/session/unsafe';run('account','portal',stdin='yes\n',ok=False);assert browser.read_text().splitlines()==opened
+  check('MORE interval preview confirmation, pending payment state, and payment portal',personal_billing)
   check('terms/entity acceptance, checkout decline/accept, private receipt and explicit Markdown exchange',lifecycle)
   def conflict():
    local=(team/'tasks.md').read_text();Backend.revision+=1;run('team','push',stdin='yes\n',ok=False);assert (team/'tasks.md').read_text()==local

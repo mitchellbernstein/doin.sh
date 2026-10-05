@@ -17,6 +17,9 @@ jobs:
       - name: Real executable behavior tests
         run: |
           python3 tests/e2e.py
+          python3 tests/update_e2e.py
+          python3 tests/uninstall_e2e.py
+          python3 tests/uninstall_pty_e2e.py
           python3 tests/auth_e2e.py
           python3 tests/tui_e2e.py
           python3 tests/reflow_e2e.py

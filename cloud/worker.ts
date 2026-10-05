@@ -1,8 +1,10 @@
+import {webAccount} from './web-account';
 import {personalFoldersRoute,personalDocumentWrite} from './personal-folders';
 import {teamRoute,teamAccountDeletionGuard,teamAccess} from './team';
 import {providerOAuthPublic,providerOAuthRoute} from './mcp-oauth';
 import {taskOAuthPublic,grantRoute,remoteTaskMcp,cleanupMcpAccount} from './mcp-server';
 import {mcpRoute} from './mcp';
+import {accountPreferencesRoute} from './account-preferences';
 interface Env {
   DB: D1Database;
   OAUTH_KV: KVNamespace;
@@ -27,7 +29,7 @@ interface Env {
 type Account = { id: string; email: string; name: string; customer_id: string | null; closing_at: number | null };
 type Session = Account & { token_hash: string };
 type DocumentRevision = { revision: number; content: string; updated_at: number };
-type Subscription = { id: string; status: string; customer: string; latest_invoice: string | null; cancel_at_period_end: boolean; items: { data: { price: { id: string }; current_period_end: number }[] } };
+type Subscription = { id: string; status: string; customer: string; latest_invoice: string | null; cancel_at_period_end: boolean; pending_update?: unknown; items: { data: { id?: string; price: { id: string }; current_period_end: number; quantity?: number }[] } };
 const encoder = new TextEncoder();
 const configured = (value: string | undefined) => !!value && !value.startsWith('REPLACE_');
 const now = () => Math.floor(Date.now() / 1000);
@@ -100,7 +102,7 @@ async function startLogin(request: Request,env: Env) {
   const id=random(),token=random(),code=String(crypto.getRandomValues(new Uint32Array(1))[0]%1000000).padStart(6,'0');
   await env.DB.prepare('INSERT INTO auth_requests(id,email,device_name,challenge,link_hash,confirmation_hash,expires_at) VALUES(?,?,?,?,?,?,?)').bind(id,email,data.name.trim(),data.code_challenge,await hash(token),await hash(`${id}\n${code}`),now()+600).run();
   try {
-    await env.EMAIL.send({to:email,from:env.EMAIL_FROM,subject:'Confirm your doin.sh sign-in',text:`You requested sign-in on ${data.name.trim()}.\n\nOpen this link and enter the six-digit confirmation code shown in your doin terminal. The link expires in ten minutes.\n${env.ORIGIN}/auth/verify?token=${token}\n\nIf you did not request this, ignore this email. Never approve a sign-in code someone else gave you.`});
+    await env.EMAIL.send({to:email,from:env.EMAIL_FROM,subject:'Confirm your doin.sh sign-in',text:`You requested sign-in on ${data.name.trim()}.\n\nOpen this link and enter the six-digit confirmation code shown where you requested sign-in. The link expires in ten minutes.\n${env.ORIGIN}/auth/verify?token=${token}\n\nIf you did not request this, ignore this email. Never approve a sign-in code someone else gave you.`});
   } catch {
     await env.DB.prepare('DELETE FROM auth_requests WHERE id=?').bind(id).run();
     fail(503,'email_unavailable');
@@ -112,13 +114,13 @@ async function verifyLogin(request: Request,env: Env,url: URL) {
   if (typeof data.token!=='string' || !/^[0-9a-f]{64}$/.test(data.token)) fail(401,'invalid_login');
   const saved=await env.DB.prepare('SELECT * FROM auth_requests WHERE link_hash=? AND expires_at>? AND claimed_hash IS NULL').bind(await hash(data.token),now()).first<AuthRequest>();
   if (!saved) fail(401,'invalid_login');
-  if (request.method==='GET') return page(`<h1>Confirm sign-in.</h1><p>Only continue if you requested sign-in from doin on ${escape(saved.device_name)}.</p><p>Enter the six-digit code shown in your terminal. Do not use a code someone else gave you.</p><form method="post" action="/auth/verify"><input type="hidden" name="token" value="${data.token}"><label>Terminal code <input name="confirmation_code" inputmode="numeric" autocomplete="off" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label><button>Confirm sign-in</button></form>`);
+  if (request.method==='GET') return page(`<h1>Confirm sign-in.</h1><p>Only continue if you requested sign-in from doin on ${escape(saved.device_name)}.</p><p>Enter the six-digit code shown where you requested sign-in. Do not use a code someone else gave you.</p><form method="post" action="/auth/verify"><input type="hidden" name="token" value="${data.token}"><label>Sign-in code <input name="confirmation_code" inputmode="numeric" autocomplete="off" pattern="[0-9]{6}" minlength="6" maxlength="6" required></label><button>Confirm sign-in</button></form>`);
   if (request.headers.get('origin')!==env.ORIGIN) fail(403,'forbidden');
   const attempt=await env.DB.prepare('UPDATE auth_requests SET verification_attempts=verification_attempts+1 WHERE id=? AND verification_attempts<5 AND expires_at>? AND claimed_hash IS NULL RETURNING verification_attempts').bind(saved.id,now()).first();
   if (!attempt) fail(429,'try_later');
   if (typeof data.confirmation_code!=='string' || !/^[0-9]{6}$/.test(data.confirmation_code) || await hash(`${saved.id}\n${data.confirmation_code}`)!==saved.confirmation_hash) fail(400,'incorrect_confirmation_code');
   await env.DB.prepare('UPDATE auth_requests SET approved_at=COALESCE(approved_at,?) WHERE id=? AND expires_at>? AND claimed_hash IS NULL').bind(now(),saved.id,now()).run();
-  return page('<h1>Sign-in confirmed.</h1><p>Return to your doin terminal. You can close this tab.</p>');
+  return page('<h1>Sign-in confirmed.</h1><p>Return to the app or browser where you requested sign-in. You can close this tab.</p>');
 }
 async function pollLogin(request: Request,env: Env) {
   const data=await body(request);
@@ -161,6 +163,34 @@ async function renewBilling(account: Account,env: Env,lock: string) {
   const renewed=await env.DB.prepare('UPDATE accounts SET billing_lock_until=? WHERE id=? AND billing_lock=? RETURNING id').bind(now()+60,account.id,lock).first();
   if (!renewed) fail(409,'billing_busy');
 }
+type BillingInterval='month'|'year';
+type BillingItem={id:string;price:{id:string;unit_amount?:number|null;currency?:string};current_period_end:number;quantity?:number};
+type BillingChangeQuote={quote_id:string;account_id:string;customer_id:string;subscription_id:string;item_id:string;current_period_end:number;from_price_id:string;to_price_id:string;interval:BillingInterval;amount_due:number;currency:'usd';proration_date:number;expires_at:number;idempotency_key:string;state:'quoted'|'applying'|'pending'|'complete'|'failed'};
+const intervalForPrice=(env:Env,id:unknown):BillingInterval|null=>typeof id==='string'&&id===env.STRIPE_YEARLY_PRICE_ID&&configured(env.STRIPE_YEARLY_PRICE_ID)?'year':typeof id==='string'&&[env.STRIPE_MONTHLY_PRICE_ID,env.STRIPE_PRICE_ID].some(price=>configured(price)&&price===id)?'month':null;
+const amountForInterval=(interval:BillingInterval|null)=>interval==='year'?4999:interval==='month'?499:null;
+const targetPrice=(env:Env,interval:BillingInterval)=>interval==='year'?env.STRIPE_YEARLY_PRICE_ID:env.STRIPE_MONTHLY_PRICE_ID;
+async function activePersonalSubscription(account:Account,env:Env){
+  const list=await subscriptions(account,env),owned=list.filter(s=>s.customer===account.customer_id&&s.items.data.some(i=>acceptedPrice(env,i.price.id))&&!['canceled','incomplete_expired'].includes(s.status));
+  if(owned.length!==1)fail(409,owned.length?'multiple_subscriptions':'no_active_subscription');
+  const subscription=owned[0],items=subscription.items.data.filter(i=>acceptedPrice(env,i.price.id));
+  if(subscription.status!=='active'||items.length!==1||subscription.items.data.length!==1||items[0].current_period_end<=now()||typeof items[0].id!=='string'||!/^si_/.test(items[0].id))fail(409,'no_active_subscription');
+  return {subscription,item:items[0] as BillingItem,currentInterval:intervalForPrice(env,items[0].price.id)};
+}
+function pendingInterval(env:Env,subscription:Subscription){
+  const update=subscription.pending_update as {subscription_items?:{price?:string|{id?:string}}[]}|null|undefined;
+  const price=update?.subscription_items?.map(item=>typeof item.price==='string'?item.price:item.price?.id).find(id=>intervalForPrice(env,id));
+  return intervalForPrice(env,price);
+}
+async function validatedTargetPrice(env:Env,interval:BillingInterval){
+  const id=targetPrice(env,interval);if(!configured(id))fail(503,'billing_not_configured');
+  const price=await stripe(env,`prices/${encodeURIComponent(id!)}`);
+  if(price.id!==id||price.active!==true||price.unit_amount!==amountForInterval(interval)||price.currency!=='usd'||price.recurring?.interval!==interval||price.recurring.interval_count!==1)fail(503,'invalid_sync_price');
+  return id!;
+}
+function changePreviewFields(quote:Pick<BillingChangeQuote,'customer_id'|'subscription_id'|'item_id'|'to_price_id'|'proration_date'>){return {customer:quote.customer_id,subscription:quote.subscription_id,'subscription_details[items][0][id]':quote.item_id,'subscription_details[items][0][price]':quote.to_price_id,'subscription_details[items][0][quantity]':'1','subscription_details[proration_date]':String(quote.proration_date),'subscription_details[proration_behavior]':'always_invoice'};}
+function changeUpdateFields(quote:Pick<BillingChangeQuote,'item_id'|'to_price_id'|'proration_date'>){return {'items[0][id]':quote.item_id,'items[0][price]':quote.to_price_id,'items[0][quantity]':'1',proration_behavior:'always_invoice',payment_behavior:'pending_if_incomplete',proration_date:String(quote.proration_date)};}
+function billingPortalUrl(value:unknown){if(typeof value!=='string'||value.length>4096)fail(503,'billing_unavailable');let url:URL;try{url=new URL(value);}catch{fail(503,'billing_unavailable');}if(url.protocol!=='https:'||url.hostname!=='billing.stripe.com'||url.username||url.password||url.port)fail(503,'billing_unavailable');return url.href;}
+function changeResult(interval:BillingInterval|null,paymentPending:boolean,changed:boolean,pendingTarget:BillingInterval|null=null){return json({changed,payment_pending:paymentPending,interval,pending_interval:paymentPending?pendingTarget:null});}
 async function subscriptions(account: Account, env: Env): Promise<Subscription[]> {
   if (!account.customer_id) return [];
   const result = await stripe(env, `subscriptions?customer=${encodeURIComponent(account.customer_id)}&status=all&limit=100`);
@@ -170,6 +200,135 @@ async function subscriptions(account: Account, env: Env): Promise<Subscription[]
     if (subscription.items.data.some((item: {price?:{id?:unknown};current_period_end?:unknown})=>typeof item.price?.id!=='string' || !Number.isSafeInteger(item.current_period_end))) fail(503,'billing_unavailable');
   }
   return result.data;
+}
+async function subscriptionById(env:Env,quote:BillingChangeQuote){
+  const result=await stripe(env,`subscriptions/${encodeURIComponent(quote.subscription_id)}`);
+  if(result.id!==quote.subscription_id||result.customer!==quote.customer_id||!Array.isArray(result.items?.data)||result.items.data.length!==1||result.items.data[0].id!==quote.item_id||typeof result.items.data[0].price?.id!=='string'||!Number.isSafeInteger(result.items.data[0].current_period_end))fail(503,'billing_unavailable');
+  return result as Subscription;
+}
+function pendingPriceId(subscription:Subscription){
+  const update=subscription.pending_update as {subscription_items?:{price?:string|{id?:string}}[]}|null|undefined;
+  const first=update?.subscription_items?.[0]?.price;
+  return typeof first==='string'?first:first?.id??null;
+}
+async function reconcileBillingChange(env:Env,account:Account){
+  const quote=await env.DB.prepare("SELECT * FROM billing_change_quotes WHERE account_id=? AND state IN ('applying','pending') LIMIT 1").bind(account.id).first<BillingChangeQuote>();
+  if(!quote)return null;
+  const remote=await subscriptionById(env,quote);
+  const item=remote.items.data[0];
+  if(remote.pending_update){
+    if(remote.status==='active'&&item.price.id===quote.from_price_id&&pendingPriceId(remote)===quote.to_price_id)return quote.interval;
+    await env.DB.prepare("UPDATE billing_change_quotes SET state='failed' WHERE quote_id=? AND account_id=? AND state IN ('applying','pending')").bind(quote.quote_id,account.id).run();
+    return null;
+  }
+  if(remote.status==='active'&&item.price.id===quote.to_price_id&&item.current_period_end>now()){
+    await env.DB.prepare("UPDATE billing_change_quotes SET state='complete' WHERE quote_id=? AND account_id=? AND state IN ('applying','pending')").bind(quote.quote_id,account.id).run();
+    return null;
+  }
+  if(remote.status!=='active'||item.current_period_end<=now()||item.price.id!==quote.from_price_id||quote.state==='pending'||quote.expires_at<=now()||item.current_period_end!==quote.current_period_end){
+    await env.DB.prepare("UPDATE billing_change_quotes SET state='failed' WHERE quote_id=? AND account_id=? AND state IN ('applying','pending')").bind(quote.quote_id,account.id).run();
+    return null;
+  }
+  return quote.interval;
+}
+async function currentPriceAmount(env:Env,price:BillingItem['price']){
+  if(Number.isSafeInteger(price.unit_amount)&&(price.unit_amount as number)>=0&&price.currency==='usd')return price.unit_amount as number;
+  const current=await stripe(env,`prices/${encodeURIComponent(price.id)}`);
+  if(current.id!==price.id||current.currency!=='usd'||!Number.isSafeInteger(current.unit_amount)||current.unit_amount<0)fail(503,'billing_unavailable');
+  return current.unit_amount as number;
+}
+async function billingChangeLimit(env:Env,account:Account){
+  const hour=Math.floor(now()/3600),key=`billing:${account.id}:${hour}`;
+  const row=await env.DB.prepare('INSERT INTO rate_limits(key,hits,expires_at) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET hits=hits+1 RETURNING hits').bind(key,(hour+2)*3600).first<{hits:number}>();
+  if((row?.hits??0)>10)fail(429,'try_later');
+}
+function changeQuoteResponse(quote:BillingChangeQuote){
+  return json({confirmation_required:true,quote_id:quote.quote_id,amount_due:quote.amount_due,currency:quote.currency,interval:quote.interval,expires_at:quote.expires_at,proration_date:quote.proration_date});
+}
+async function applyBillingChange(env:Env,quote:BillingChangeQuote,account:Account){
+  if(!account.customer_id||quote.customer_id!==account.customer_id)fail(409,'billing_quote_stale');
+  let remote=await subscriptionById(env,quote),item=remote.items.data[0];
+  if(remote.status!=='active'||item.current_period_end<=now()){
+    await env.DB.prepare("UPDATE billing_change_quotes SET state='failed' WHERE quote_id=? AND account_id=? AND state IN ('applying','pending')").bind(quote.quote_id,account.id).run();fail(409,'no_active_subscription');
+  }
+  if(item.price.id===quote.to_price_id&&!remote.pending_update){await env.DB.prepare("UPDATE billing_change_quotes SET state='complete' WHERE quote_id=? AND account_id=?").bind(quote.quote_id,account.id).run();return changeResult(quote.interval,false,true);}
+  if(item.price.id!==quote.from_price_id)fail(409,'billing_quote_stale');
+  if(remote.cancel_at_period_end)fail(409,'subscription_cancel_pending');
+  if(remote.pending_update){
+    if(pendingPriceId(remote)!==quote.to_price_id)fail(409,'billing_quote_stale');
+    await env.DB.prepare("UPDATE billing_change_quotes SET state='pending' WHERE quote_id=? AND account_id=?").bind(quote.quote_id,account.id).run();return changeResult(intervalForPrice(env,item.price.id),true,false,quote.interval);
+  }
+  if(quote.state==='pending'){
+    await env.DB.prepare("UPDATE billing_change_quotes SET state='failed' WHERE quote_id=? AND account_id=?").bind(quote.quote_id,account.id).run();fail(409,'billing_change_payment_failed');
+  }
+  if(quote.expires_at<=now()||item.current_period_end!==quote.current_period_end){
+    await env.DB.prepare("UPDATE billing_change_quotes SET state='failed' WHERE quote_id=? AND account_id=? AND state='applying'").bind(quote.quote_id,account.id).run();fail(409,'billing_quote_expired');
+  }
+  await stripe(env,`subscriptions/${encodeURIComponent(quote.subscription_id)}`,changeUpdateFields(quote),quote.idempotency_key);
+  remote=await subscriptionById(env,quote);item=remote.items.data[0];
+  if(remote.pending_update){await env.DB.prepare("UPDATE billing_change_quotes SET state='pending' WHERE quote_id=? AND account_id=?").bind(quote.quote_id,account.id).run();return changeResult(intervalForPrice(env,item.price.id),true,false,quote.interval);}
+  if(remote.status==='active'&&item.price.id===quote.to_price_id&&item.current_period_end>now()){
+    await env.DB.prepare("UPDATE billing_change_quotes SET state='complete' WHERE quote_id=? AND account_id=?").bind(quote.quote_id,account.id).run();return changeResult(quote.interval,false,true);
+  }
+  fail(503,'billing_unavailable');
+}
+async function billingChange(account:Account,env:Env,data:any){
+  if(env.SELF_HOST_MODE==='personal')fail(409,'managed_plan_unavailable');
+  const interval=data.interval as BillingInterval;
+  if(!['month','year'].includes(interval)||Object.keys(data).some(key=>!['interval','quote_id','confirm_amount'].includes(key)))fail(400,'valid_interval_required');
+  const confirming=data.quote_id!==undefined||data.confirm_amount!==undefined;
+  if(confirming&&(typeof data.quote_id!=='string'||!/^([0-9a-f]{64})$/.test(data.quote_id)||!Number.isSafeInteger(data.confirm_amount)||data.confirm_amount<0))fail(400,'quote_and_amount_required');
+  return billingMutation(account,env,async lock=>{
+    if(confirming){
+      const quote=await env.DB.prepare('SELECT * FROM billing_change_quotes WHERE quote_id=? AND account_id=?').bind(data.quote_id,account.id).first<BillingChangeQuote>();
+      if(!quote||quote.interval!==interval)fail(409,'billing_quote_unavailable');
+      if(data.confirm_amount!==quote.amount_due)fail(409,'billing_quote_amount_changed');
+      if(quote.state==='complete')return changeResult(quote.interval,false,true);
+      if(quote.state==='failed'||quote.state==='quoted'&&quote.expires_at<=now())fail(409,'billing_quote_expired');
+      if(quote.state==='applying'||quote.state==='pending'){
+        // Reconcile an uncertain earlier call before replaying its exact saved Stripe request.
+        await renewBilling(account,env,lock);
+        return applyBillingChange(env,quote,account);
+      }
+      const {subscription,item,currentInterval}=await activePersonalSubscription(account,env);
+      if(subscription.pending_update)fail(409,'billing_change_pending');
+      if(subscription.cancel_at_period_end)fail(409,'subscription_cancel_pending');
+      if(subscription.id!==quote.subscription_id||subscription.customer!==quote.customer_id||item.id!==quote.item_id||item.current_period_end!==quote.current_period_end||item.price.id!==quote.from_price_id||currentInterval===interval)fail(409,'billing_quote_stale');
+      if(targetPrice(env,interval)!==quote.to_price_id)fail(409,'billing_quote_stale');
+      const selected=await validatedTargetPrice(env,interval);
+      if(selected!==quote.to_price_id)fail(409,'billing_quote_stale');
+      await renewBilling(account,env,lock);
+      const preview=await stripe(env,'invoices/create_preview',changePreviewFields(quote));
+      if(!Number.isSafeInteger(preview.amount_due)||preview.amount_due<0||preview.currency!=='usd')fail(503,'invalid_billing_preview');
+      if(preview.amount_due!==quote.amount_due||data.confirm_amount!==preview.amount_due){
+        await env.DB.prepare('UPDATE billing_change_quotes SET amount_due=? WHERE quote_id=? AND account_id=? AND state=\'quoted\'').bind(preview.amount_due,quote.quote_id,account.id).run();
+        return changeQuoteResponse({...quote,amount_due:preview.amount_due});
+      }
+      const applying=await env.DB.prepare("UPDATE billing_change_quotes SET state='applying' WHERE quote_id=? AND account_id=? AND state='quoted' AND expires_at>? RETURNING quote_id").bind(quote.quote_id,account.id,now()).first();
+      if(!applying)fail(409,'billing_quote_expired');
+      await renewBilling(account,env,lock);
+      return applyBillingChange(env,{...quote,state:'applying'},account);
+    }
+    if(!account.customer_id)fail(409,'no_active_subscription');
+    if(await reconcileBillingChange(env,account))fail(409,'billing_change_pending');
+    const {subscription,item,currentInterval}=await activePersonalSubscription(account,env);
+    if(subscription.pending_update)fail(409,'billing_change_pending');
+    if(currentInterval===interval)return changeResult(currentInterval,false,false);
+    if(subscription.cancel_at_period_end)fail(409,'subscription_cancel_pending');
+    const reusable=await env.DB.prepare("SELECT * FROM billing_change_quotes WHERE account_id=? AND state='quoted' AND expires_at>? AND interval=? AND customer_id=? AND subscription_id=? AND item_id=? AND current_period_end=? AND from_price_id=? AND to_price_id=? ORDER BY created_at DESC LIMIT 1").bind(account.id,now(),interval,subscription.customer,subscription.id,item.id,item.current_period_end,item.price.id,targetPrice(env,interval)).first<BillingChangeQuote>();
+    if(reusable)return changeQuoteResponse(reusable);
+    await billingChangeLimit(env,account);
+    const toPriceId=await validatedTargetPrice(env,interval),quoteId=random(),prorationDate=now(),expiresAt=now()+300;
+    const candidate:BillingChangeQuote={quote_id:quoteId,account_id:account.id,customer_id:account.customer_id,subscription_id:subscription.id,item_id:item.id,current_period_end:item.current_period_end,from_price_id:item.price.id,to_price_id:toPriceId,interval,amount_due:0,currency:'usd',proration_date:prorationDate,expires_at:expiresAt,idempotency_key:`doin-period-switch-${quoteId}`,state:'quoted'};
+    await renewBilling(account,env,lock);
+    const preview=await stripe(env,'invoices/create_preview',changePreviewFields(candidate));
+    if(!Number.isSafeInteger(preview.amount_due)||preview.amount_due<0||preview.currency!=='usd')fail(503,'invalid_billing_preview');
+    candidate.amount_due=preview.amount_due;
+    await env.DB.prepare("UPDATE billing_change_quotes SET state='failed' WHERE account_id=? AND state='quoted' AND expires_at<=?").bind(account.id,now()).run();
+    await env.DB.prepare("DELETE FROM billing_change_quotes WHERE account_id=? AND created_at<? AND (state IN ('complete','failed') OR (state='quoted' AND expires_at<?))").bind(account.id,now()-86400,now()-86400).run();
+    await env.DB.prepare('INSERT INTO billing_change_quotes(quote_id,account_id,customer_id,subscription_id,item_id,current_period_end,from_price_id,to_price_id,interval,amount_due,currency,proration_date,expires_at,idempotency_key,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(candidate.quote_id,candidate.account_id,candidate.customer_id,candidate.subscription_id,candidate.item_id,candidate.current_period_end,candidate.from_price_id,candidate.to_price_id,candidate.interval,candidate.amount_due,candidate.currency,candidate.proration_date,candidate.expires_at,candidate.idempotency_key,candidate.state,now()).run();
+    return changeQuoteResponse(candidate);
+  });
 }
 const acceptedPrice = (env: Env,id: string) => [env.STRIPE_PRICE_ID,env.STRIPE_MONTHLY_PRICE_ID,env.STRIPE_YEARLY_PRICE_ID].some(p=>configured(p)&&p===id);
 function checkoutFields(account: Account,env: Env,expires: number,price=env.STRIPE_PRICE_ID) {
@@ -231,6 +390,8 @@ async function route(request: Request, env: Env,ctx:ExecutionContext): Promise<R
     const handled=await providerOAuthPublic(request,env,{paid});
     if(handled) return handled;
   }
+  const browserAccount=webAccount(request);
+  if(browserAccount)return browserAccount;
   if (path === '/health' && request.method === 'GET') return json({ service: 'doin-sync' });
   if (path === '/v1/plan' && request.method === 'GET') {
     const mode = /^(sk|rk)_test_/.test(env.STRIPE_SECRET_KEY || '') ? 'test' : /^(sk|rk)_live_/.test(env.STRIPE_SECRET_KEY || '') ? 'live' : 'unavailable';
@@ -245,6 +406,7 @@ async function route(request: Request, env: Env,ctx:ExecutionContext): Promise<R
   if (path === '/auth/verify' && ['GET','POST'].includes(request.method)) return verifyLogin(request,env,url);
   if (path === '/' || path === '/account' || path.startsWith('/auth/') || path === '/v1/portal') fail(404,'account_management_in_terminal');
   const who=await session(request,env);
+  if(path==='/v1/account/preferences') return accountPreferencesRoute(request,env,who,{body});
   if (path === '/v1/folders' || path.startsWith('/v1/folders/')) return personalFoldersRoute(request,env,who,{body,paid:async()=>{if(!await subscribed(who,env))fail(402,'subscription_required');}});
   if (path === '/v1/teams' || path.startsWith('/v1/teams/')) return teamRoute(request,env,who,{body,stripe:(path,fields,key,method)=>stripe(env,path,fields,key,method),emailAddress});
   if(path==='/v1/mcp/grants'||path.startsWith('/v1/mcp/grants/')) return grantRoute(request,env,who,{body,subscribed:(teamId?:string)=>teamId?paidAccount(who.id,env,teamId):subscribed(who,env),teamPaid:async id=>(await teamAccess(env,who.id,id,true)).active});
@@ -300,8 +462,20 @@ async function route(request: Request, env: Env,ctx:ExecutionContext): Promise<R
   }
   if (path === '/v1/billing' && request.method==='GET') {
     if (env.SELF_HOST_MODE === 'personal') return json({active:await subscribed(who,env),status:'personal_self_hosted',cancel_at_period_end:false,current_period_end:0});
+    const unresolvedQuote=who.customer_id?await reconcileBillingChange(env,who):null;
     const list=await subscriptions(who,env),active=list.filter(s=>s.status==='active' && s.items?.data?.some(i=>acceptedPrice(env,i.price?.id) && i.current_period_end>now()));
-    return json({active:active.length>0,status:active.length ? 'active' : list[0]?.status || 'none',cancel_at_period_end:active.length>0 && active.every(s=>s.cancel_at_period_end),current_period_end:Math.max(0,...active.flatMap(s=>s.items.data.filter(i=>acceptedPrice(env,i.price?.id)).map(i=>i.current_period_end)))});
+    const current=active.length===1&&active[0].items.data.length===1&&acceptedPrice(env,active[0].items.data[0].price.id)?active[0]:null;
+    const currentItem=current?.items.data[0],currentInterval=current?intervalForPrice(env,currentItem!.price.id):null,pending=!!current?.pending_update||!!unresolvedQuote;
+    const amount=currentItem?await currentPriceAmount(env,currentItem.price):null;
+    return json({active:active.length>0,status:active.length ? 'active' : list[0]?.status || 'none',cancel_at_period_end:active.length>0 && active.every(s=>s.cancel_at_period_end),current_period_end:Math.max(0,...active.flatMap(s=>s.items.data.filter(i=>acceptedPrice(env,i.price?.id)).map(i=>i.current_period_end))),interval:currentInterval,amount,currency:'usd',pending_update:pending,pending_interval:current?.pending_update?pendingInterval(env,current):unresolvedQuote});
+  }
+  if(path==='/v1/billing/change'&&request.method==='POST')return billingChange(who,env,await body(request,8192,true));
+  if(path==='/v1/billing/portal'&&request.method==='POST'){
+    if(env.SELF_HOST_MODE==='personal')fail(409,'managed_plan_unavailable');
+    if(!who.customer_id)fail(409,'no_billing_customer');
+    const returnUrl=`${env.ORIGIN}/account`,portal=await stripe(env,'billing_portal/sessions',{customer:who.customer_id,return_url:returnUrl,'flow_data[type]':'payment_method_update','flow_data[after_completion][type]':'redirect','flow_data[after_completion][redirect][return_url]':returnUrl});
+    if(portal.customer!==who.customer_id)fail(503,'billing_unavailable');
+    return json({url:billingPortalUrl(portal.url)});
   }
   if (['/v1/billing/cancel','/v1/billing/resume'].includes(path) && request.method==='POST') {
     return billingMutation(who,env,async lock=>{
@@ -316,7 +490,7 @@ async function route(request: Request, env: Env,ctx:ExecutionContext): Promise<R
     });
   }
   if (path === '/v1/billing/recover' && request.method==='POST') {
-    const list=(await subscriptions(who,env)).filter(s=>s.customer===who.customer_id && ['past_due','incomplete','unpaid'].includes(s.status) && s.items?.data?.some(i=>acceptedPrice(env,i.price?.id)));
+    const list=(await subscriptions(who,env)).filter(s=>s.customer===who.customer_id && (['past_due','incomplete','unpaid'].includes(s.status)||(s.status==='active'&&!!s.pending_update)) && s.items?.data?.some(i=>acceptedPrice(env,i.price?.id)));
     for (const subscription of list) {
       if (typeof subscription.latest_invoice!=='string') continue;
       const invoice=await stripe(env,`invoices/${encodeURIComponent(subscription.latest_invoice)}`);
@@ -392,8 +566,8 @@ export default {
     headers.set('cache-control', 'no-store');
     headers.set('x-content-type-options', 'nosniff');
     // Native form navigation needs its real Origin; omit path/query from Referer.
-    headers.set('referrer-policy', 'strict-origin');
-    headers.set('content-security-policy', "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    if(!headers.has('referrer-policy')) headers.set('referrer-policy', 'strict-origin');
+    if(!headers.has('content-security-policy')) headers.set('content-security-policy', "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
     headers.set('strict-transport-security', 'max-age=31536000');
     return new Response(response.body, { status: response.status, headers });
   },

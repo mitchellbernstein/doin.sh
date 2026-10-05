@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node tests/e2e.mjs && node tests/mcp-e2e.mjs && node tests/mcp-oauth-e2e.mjs && node tests/team-e2e.mjs && node tests/folders-e2e.mjs && node tests/personal-folders-e2e.mjs",
+    "test": "node tests/e2e.mjs && node tests/mcp-e2e.mjs && node tests/mcp-oauth-e2e.mjs && node tests/team-e2e.mjs && node tests/folders-e2e.mjs && node tests/personal-folders-e2e.mjs && node tests/account-preferences-e2e.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
