@@ -123,12 +123,6 @@ fn load() !Config {
     const bytes = try read(try join(&.{ try dir(), "config.json" }));
     return (try std.json.parseFromSlice(Config, A, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })).value;
 }
-fn uninstallChoice() ![]const u8 {
-    return setupChoice("What should happen to your task folders?", &.{
-        .{ .value = "keep", .label = "Keep task folders (Recommended)", .detail = "Remove only doin and its app settings" },
-        .{ .value = "delete", .label = "Delete task folders and ALL their contents", .detail = "Permanently remove every file in the listed folders" },
-    });
-}
 fn uninstallCommand(args: []const []const u8) !void {
     if (args.len != 0) return error.InvalidUninstallArguments;
     const config_dir = try dir();
@@ -152,7 +146,7 @@ fn uninstallCommand(args: []const []const u8) !void {
         std.fs.cwd().access(config_path, .{}) catch |err| break :blk err == error.FileNotFound;
         break :blk false;
     };
-    uninstall.run(A, .{ .config_dir = config_dir, .executable = try std.fs.selfExePathAlloc(A), .task_roots = roots.items, .jobs = jobs.items, .config_readable = config != null or missing }, .{ .prompt = prompt, .choose = uninstallChoice }) catch |err| {
+    uninstall.run(A, .{ .config_dir = config_dir, .executable = try std.fs.selfExePathAlloc(A), .task_roots = roots.items, .jobs = jobs.items, .config_readable = config != null or missing }, .{ .prompt = prompt }) catch |err| {
         if (err == error.InputClosed or err == error.EndOfStream or err == error.PickerCancelled or err == error.Interrupted) return out("Cancelled. Nothing removed.\n");
         return err;
     };
