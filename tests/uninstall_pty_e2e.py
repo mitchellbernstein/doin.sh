@@ -9,6 +9,7 @@ import pathlib
 import pty
 import re
 import select
+import signal
 import shutil
 import struct
 import subprocess
@@ -36,6 +37,30 @@ def clean_terminal(raw):
 def snapshot(root):
     return {str(f.relative_to(root)): hashlib.sha256(f.read_bytes()).hexdigest()
             for f in root.rglob('*') if f.is_file() and not f.is_symlink()}
+
+def signal_owned(process, sig):
+    if process.poll() is not None:
+        return
+    try:
+        group = os.getpgid(process.pid)
+        if group == process.pid:
+            os.killpg(group, sig)
+        else:
+            process.send_signal(sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        process.send_signal(sig)
+
+def stop_owned(process):
+    if process.poll() is not None:
+        return
+    signal_owned(process, signal.SIGTERM)
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        signal_owned(process, signal.SIGKILL)
+        process.wait(timeout=3)
 
 def fixture(base, name):
     env_source = dict(os.environ)
@@ -97,12 +122,7 @@ def run_case(base, name, actions, observed):
                     os.write(master, payload)
                     sent.add(key)
         if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
+            stop_owned(process)
             observed.update({'exit': process.returncode, 'sent': sorted(sent),
                              'timed_out': True, 'before': before, 'after': snapshot(root)})
             raise AssertionError('PTY scenario timed out; transcript saved in results.json')
@@ -122,12 +142,7 @@ def run_case(base, name, actions, observed):
         os.close(master)
         os.close(slave)
         if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
+            stop_owned(process)
 
     transcript = clean_terminal(raw).decode('utf-8', 'replace')
     observed.update({'name': name, 'exit': process.returncode, 'sent': sorted(sent),
