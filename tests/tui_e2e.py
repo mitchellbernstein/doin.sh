@@ -150,7 +150,13 @@ class Terminal:
         if self.process.poll() is None:
             if sig: os.kill(self.process.pid, sig)
             else: self.send(data)
-        self.process.wait(timeout=5); self.pump()
+        deadline = time.monotonic() + 5
+        while self.process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.process.args, 5)
+            self.pump(min(.02, remaining))
+        self.pump()
         after = termios.tcgetattr(self.slave)
         before = list(self.original); durable_after = list(after)
         pending = getattr(termios, 'PENDIN', 0)
