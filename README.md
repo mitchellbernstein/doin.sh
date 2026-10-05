@@ -131,8 +131,7 @@ Edit configuration to change storage, provider, model, or instructions. `doin in
 Release automation prepares macOS arm64/x86_64, Linux arm64/x86_64, and Windows x86_64 archives with SHA-256 checksums. Download an archive from [Releases](https://github.com/mitchellbernstein/doin.sh/releases/latest), or download and run the checksum-verifying installer:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mitchellbernstein/doin.sh/main/scripts/install.sh -o /tmp/doin-install.sh
-sh /tmp/doin-install.sh
+curl -fsSL https://raw.githubusercontent.com/mitchellbernstein/doin.sh/main/scripts/install.sh | sh
 ```
 
 Default install location: `~/.local/bin`; override `DOIN_INSTALL_DIR`. Updates require explicit `DOIN_REPLACE=1`. Download binaries from [GitHub Releases](https://github.com/mitchellbernstein/doin.sh/releases/latest). Windows uses the checksum-verifying PowerShell installer in `scripts/install.ps1`; its default location is `%LOCALAPPDATA%\doin\bin`. Add that folder to your user PATH. Omarchy users can use the same Linux installer; see [Omarchy installation and validation status](docs/omarchy.md).
