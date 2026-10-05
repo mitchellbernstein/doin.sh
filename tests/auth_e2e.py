@@ -31,6 +31,17 @@ def shim():
     if url.endswith('/models'):
         if state.get('mode') == 'catalog_control':
             print(json.dumps({'models': [{'visibility': 'list', 'slug': '\x1b[2Jfixture-model\x1b]0;catalog-title\x07'}]})); return
+        if state.get('mode') == 'model_order':
+            print(json.dumps({'models': [
+                {'visibility': 'list', 'slug': 'gpt-6-astra'},
+                {'visibility': 'list', 'slug': 'vendor-custom'},
+                {'visibility': 'list', 'slug': 'gpt-5.6-sol'},
+                {'visibility': 'list', 'slug': 'gpt-5.6-luna'},
+                {'visibility': 'list', 'slug': 'gpt-5.6-terra'},
+                {'visibility': 'hidden', 'slug': 'hidden-luna', 'display_name': 'Hidden',},
+            ]})); return
+        if state.get('mode') == 'model_astra_only':
+            print(json.dumps({'models': [{'visibility': 'list', 'slug': 'gpt-6-astra'}]})); return
         raise SystemExit(22)  # Transient catalog failure after successful consent.
     if url.endswith('/responses'):
         assert 'Bearer fixture-access-rotated' in body or 'Bearer fixture-access-original' in body
@@ -108,37 +119,54 @@ with tempfile.TemporaryDirectory(prefix='doin-auth-e2e-') as temp:
     def login(mode='valid', ok=True, wrong_first=False, client_mismatch=False, argv=('login',), stdin=None, deny=False):
         statefile.write_text(json.dumps({'jwk': jwk, 'mode': mode}))
         urlfile = root / 'browser-url'; urlfile.unlink(missing_ok=True)
-        process = subprocess.Popen([str(binary), *argv], env=env, stdin=subprocess.PIPE if stdin is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if stdin is not None: process.stdin.write(stdin); process.stdin.flush()
-        try:
-            limit = time.monotonic() + 10
-            while not urlfile.exists():
-                if process.poll() is not None: raise AssertionError(process.communicate())
-                if time.monotonic() > limit: raise TimeoutError('Browser URL not captured')
-                time.sleep(.02)
-            auth = urllib.parse.parse_qs(urllib.parse.urlparse(urlfile.read_text()).query)
-            assert 'id_token_hint' not in auth
-            redirect = urllib.parse.urlparse(auth['redirect_uri'][0])
-            assert redirect.hostname == '127.0.0.1' and redirect.path == '/auth/callback'
-            def callback(state, fragmented=False):
-                query = urllib.parse.urlencode({'state': state, **({'error': 'access_denied'} if deny else {'code': 'fixture-code', 'client_id': 'wrong-client' if client_mismatch else 'oaiapp_fixture'})})
-                data = f'GET /auth/callback?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'.encode()
-                with socket.create_connection(('127.0.0.1', redirect.port), timeout=5) as sock:
-                    if fragmented:
-                        sock.sendall(data[:15]); time.sleep(.05); sock.sendall(data[15:])
-                    else: sock.sendall(data)
-                    return sock.recv(4096)
-            if wrong_first:
-                busy = run('logout', ok=False)
-                assert 'Another account sign-in or refresh is active' in busy.stdout + busy.stderr
-                assert b'400 Bad Request' in callback('wrong-state')
-            callback(auth['state'][0], fragmented=True)
-            stdout, stderr = process.communicate(timeout=15)
-            records.append({'argv': [*argv, mode], 'exit': process.returncode, 'output': redact(stdout + stderr)})
-            assert (process.returncode == 0) == ok, records[-1]
-        finally:
-            if process.poll() is None:
-                process.terminate(); process.wait(timeout=5)
+        stdout_path = root / 'auth-login-stdout.log'; stderr_path = root / 'auth-login-stderr.log'
+        with stdout_path.open('w+', encoding='utf-8') as stdout_log, stderr_path.open('w+', encoding='utf-8') as stderr_log:
+            process = subprocess.Popen([str(binary), *argv], env=env, stdin=subprocess.PIPE if stdin is not None else None, stdout=stdout_log, stderr=stderr_log, text=True)
+            recorded = False
+
+            def captured_output():
+                stdout_log.flush(); stderr_log.flush()
+                stdout_log.seek(0); stderr_log.seek(0)
+                return stdout_log.read(), stderr_log.read()
+
+            if stdin is not None:
+                process.stdin.write(stdin); process.stdin.flush(); process.stdin.close(); process.stdin = None
+            try:
+                limit = time.monotonic() + 10
+                while not urlfile.exists():
+                    if process.poll() is not None: raise AssertionError(captured_output())
+                    if time.monotonic() > limit: raise TimeoutError('Browser URL not captured')
+                    time.sleep(.02)
+                auth = urllib.parse.parse_qs(urllib.parse.urlparse(urlfile.read_text()).query)
+                assert 'id_token_hint' not in auth
+                host_id = auth['ext_agent_host_id'][0]
+                assert re.fullmatch(r'urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', host_id)
+                redirect = urllib.parse.urlparse(auth['redirect_uri'][0])
+                assert redirect.hostname == '127.0.0.1' and redirect.path == '/auth/callback'
+                def callback(state, fragmented=False):
+                    query = urllib.parse.urlencode({'state': state, **({'error': 'access_denied'} if deny else {'code': 'fixture-code', 'client_id': 'wrong-client' if client_mismatch else 'oaiapp_fixture'})})
+                    data = f'GET /auth/callback?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'.encode()
+                    with socket.create_connection(('127.0.0.1', redirect.port), timeout=5) as sock:
+                        if fragmented:
+                            sock.sendall(data[:15]); time.sleep(.05); sock.sendall(data[15:])
+                        else: sock.sendall(data)
+                        return sock.recv(4096)
+                if wrong_first:
+                    busy = run('logout', ok=False)
+                    assert 'Another account sign-in or refresh is active' in busy.stdout + busy.stderr
+                    assert b'400 Bad Request' in callback('wrong-state')
+                callback(auth['state'][0], fragmented=True)
+                process.wait(timeout=15)
+                stdout, stderr = captured_output()
+                records.append({'argv': [*argv, mode], 'exit': process.returncode, 'output': redact(stdout + stderr)})
+                recorded = True
+                assert (process.returncode == 0) == ok, records[-1]
+            finally:
+                if process.poll() is None:
+                    process.terminate(); process.wait(timeout=5)
+                if not recorded:
+                    stdout, stderr = captured_output()
+                    records.append({'argv': [*argv, mode], 'exit': process.returncode, 'output': redact(stdout + stderr)})
 
     run('init', '--storage', str(root / 'tasks'), '--provider', 'manual')
 
@@ -146,10 +174,25 @@ with tempfile.TemporaryDirectory(prefix='doin-auth-e2e-') as temp:
         login(wrong_first=True)
         record = json.loads(credentials.read_text())
         assert record['subject'] == 'fixture-account' and record['client_id'] == 'oaiapp_fixture'
+        assert re.fullmatch(r'urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', record['ext_agent_host_id'])
         assert record['scope'].split().count('chatgpt.tokens.use.direct') == 1
         assert credentials.stat().st_mode & 0o777 == 0o600
         assert (root / 'config' / 'host-id').stat().st_mode & 0o777 == 0o600
-    case('wrong state rejected; fragmented real callback; RSA JWT accepted; owner-only persistence', successful_login)
+        host_file = root / 'config' / 'host-id'
+        initial_host = record['ext_agent_host_id']
+        assert host_file.read_text() == initial_host
+        legacy_host = 'a' * 43
+        host_file.write_text(legacy_host)
+        record['ext_agent_host_id'] = legacy_host
+        credentials.write_text(json.dumps(record))
+        login()
+        migrated = json.loads(credentials.read_text())
+        assert migrated['client_id'] == 'oaiapp_fixture' and migrated['subject'] == 'fixture-account'
+        migrated_host = migrated['ext_agent_host_id']
+        assert migrated_host != initial_host and host_file.read_text() == migrated_host
+        login()
+        assert json.loads(credentials.read_text())['ext_agent_host_id'] == migrated_host
+    case('supported stable UUID host ID; legacy host migration retains registration; wrong state rejected; fragmented callback and RSA JWT accepted', successful_login)
 
     def rejected_identity():
         original = credentials.read_bytes()
@@ -205,14 +248,14 @@ with tempfile.TemporaryDirectory(prefix='doin-auth-e2e-') as temp:
         saved = env['DOIN_CONFIG_DIR']
         env['DOIN_CONFIG_DIR'] = str(root / 'onboarding-config')
         try:
-            login(argv=('init',), stdin=str(root / 'onboarding-tasks') + '\n\n4\nfixture-model\n')
+            login(argv=('init',), stdin=str(root / 'onboarding-tasks') + '\n\n1\nfixture-model\n')
             config = json.loads((root / 'onboarding-config' / 'config.json').read_text())
             assert config['provider'] == 'chatgpt' and config['model'] == 'fixture-model'
             assert config['storage'] == str(root / 'onboarding-tasks')
             assert 'Could not list provider models' in records[-1]['output']
             assert (root / 'onboarding-tasks' / 'tasks.md').exists()
             env['DOIN_CONFIG_DIR'] = str(root / 'denied-onboarding-config')
-            login(argv=('init',), stdin=str(root / 'denied-onboarding-tasks') + '\n\n4\n1\n', deny=True)
+            login(argv=('init',), stdin=str(root / 'denied-onboarding-tasks') + '\n\n1\n4\n1\n', deny=True)
             denied_config = json.loads((root / 'denied-onboarding-config' / 'config.json').read_text())
             assert denied_config['provider'] == 'manual'
             assert denied_config['storage'] == str(root / 'denied-onboarding-tasks')
@@ -221,10 +264,39 @@ with tempfile.TemporaryDirectory(prefix='doin-auth-e2e-') as temp:
         finally: env['DOIN_CONFIG_DIR'] = saved
     case('onboarding survives catalog outage and cancelled consent with manual fallback', onboarding)
 
+    def lighter_default():
+        saved = env['DOIN_CONFIG_DIR']; env['DOIN_CONFIG_DIR'] = str(root / 'lighter-config')
+        try:
+            login(mode='model_order', argv=('init',), stdin=str(root / 'lighter-tasks') + '\n\n1\n\n')
+            config = json.loads((root / 'lighter-config' / 'config.json').read_text())
+            assert config['provider'] == 'chatgpt' and config['model'] == 'gpt-5.6-luna'
+            output = records[-1]['output']
+            ordered = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra', 'vendor-custom']
+            assert [output.index(model) for model in ordered] == sorted(output.index(model) for model in ordered)
+            assert 'hidden-luna' not in output
+        finally: env['DOIN_CONFIG_DIR'] = saved
+    case('new ChatGPT setup defaults to an advertised Luna and excludes hidden catalog models', lighter_default)
+
+    def no_luna_default():
+        saved = env['DOIN_CONFIG_DIR']; env['DOIN_CONFIG_DIR'] = str(root / 'astra-only-config')
+        try:
+            login(mode='model_astra_only', argv=('init',), stdin=str(root / 'astra-only-tasks') + '\n\n1\ngpt-6-astra\n')
+            config = json.loads((root / 'astra-only-config' / 'config.json').read_text())
+            assert config['model'] == 'gpt-6-astra'
+            assert 'Model []:' in records[-1]['output']
+            run('provider', 'chatgpt', '--model', 'gpt-6-astra')
+            statefile.write_text(json.dumps({'jwk': jwk, 'mode': 'model_astra_only'}))
+            repeated = subprocess.run([str(binary), 'provider'], env=env, input='1\n\n', capture_output=True, text=True, timeout=20)
+            assert repeated.returncode == 0, repeated.stdout + repeated.stderr
+            assert 'Model [gpt-6-astra]:' in repeated.stdout + repeated.stderr
+            assert json.loads((root / 'astra-only-config' / 'config.json').read_text())['model'] == 'gpt-6-astra'
+        finally: env['DOIN_CONFIG_DIR'] = saved
+    case('Astra-only ChatGPT catalog leaves the model prompt blank and accepts explicit Astra', no_luna_default)
+
     def catalog_controls():
         saved = env['DOIN_CONFIG_DIR']; env['DOIN_CONFIG_DIR'] = str(root / 'catalog-config')
         try:
-            login(mode='catalog_control', argv=('init',), stdin=str(root / 'catalog-tasks') + '\n\n4\nfixture-model\n')
+            login(mode='catalog_control', argv=('init',), stdin=str(root / 'catalog-tasks') + '\n\n1\nfixture-model\n')
             output = records[-1]['output']
             assert '\x1b' not in output and 'catalog-title' not in output
             assert 'Could not list provider models' in output
@@ -232,8 +304,10 @@ with tempfile.TemporaryDirectory(prefix='doin-auth-e2e-') as temp:
         finally: env['DOIN_CONFIG_DIR'] = saved
     case('ChatGPT model catalog strips CSI and OSC before terminal output', catalog_controls)
 
-    calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
+    calls_file = root / 'calls.jsonl'
+    calls = [json.loads(line) for line in calls_file.read_text().splitlines()] if calls_file.exists() else []
     def secret_arguments():
+        assert calls_file.exists(), 'dependency call log missing'
         argv = json.dumps(calls)
         for secret in ('fixture-access-original', 'fixture-access-rotated', 'fixture-refresh-original', 'fixture-refresh-rotated'):
             assert secret not in argv

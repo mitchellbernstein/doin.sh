@@ -274,6 +274,17 @@ fn modelChoices(c: Config) ![]const terminal.ModelOption {
         try options.append(A, .{ .value = slug, .label = try terminal.clean(A, display, false), .detail = slug });
     }
     if (options.items.len == 0) return error.NoModelChoices;
+    if (std.mem.eql(u8, c.provider, "chatgpt")) {
+        for (1..options.items.len) |i| {
+            const option = options.items[i];
+            const rank = chatgptModelRank(option.value);
+            var j = i;
+            while (j > 0 and chatgptModelRank(options.items[j - 1].value) > rank) : (j -= 1) {
+                options.items[j] = options.items[j - 1];
+            }
+            options.items[j] = option;
+        }
+    }
     return options.toOwnedSlice(A);
 }
 fn modelCapabilities(c: Config, model: []const u8) !ModelCapabilities {
@@ -313,6 +324,14 @@ fn modelCapabilities(c: Config, model: []const u8) !ModelCapabilities {
 fn selectedSupported(options: []const terminal.ModelOption, value: []const u8) bool {
     for (options) |option| if (std.mem.eql(u8, option.value, value)) return true;
     return false;
+}
+fn chatgptModelRank(model: []const u8) u8 {
+    if (std.mem.eql(u8, model, "gpt-6-luna")) return 0;
+    if (std.mem.endsWith(u8, model, "-luna")) return 1;
+    if (std.mem.endsWith(u8, model, "-terra")) return 2;
+    if (std.mem.endsWith(u8, model, "-sol")) return 3;
+    if (std.mem.endsWith(u8, model, "-astra")) return 4;
+    return 5;
 }
 fn modelPicker(c: Config) !void {
     const choices = modelChoices(c) catch |err| blk: {
@@ -373,12 +392,14 @@ fn modelPicker(c: Config) !void {
 }
 
 fn setupQuestion(number: usize, text: []const u8) !void {
+    if (terminal.rich()) return;
     try say("\n{d} {s}/{s} {s}\n", .{ number, if (terminal.rich()) "\x1b[2m" else "", if (terminal.rich()) "\x1b[0m" else "", text });
 }
-fn setupChoice(label: []const u8, options: []const terminal.ModelOption) ![]const u8 {
+const setup_back = "__setup_back";
+fn setupChoiceWithBack(label: []const u8, options: []const terminal.ModelOption, escape_back: bool) ![]const u8 {
     if (terminal.rich()) {
         while (true) {
-            const result = terminal.modelPick(A, .{ .name = label, .prefix = "", .suffix = "", .placeholder = "Choose an option", .options = options, .explanation = "", .selection_only = true }) catch |err| {
+            const result = terminal.modelPick(A, .{ .name = label, .prefix = "", .suffix = "", .placeholder = "Choose an option", .options = options, .explanation = "", .selection_only = true, .escape_back = escape_back }) catch |err| {
                 if (err == error.PickerResized) continue;
                 if (err == error.PickerCancelled) return error.PickerCancelled;
                 if (err == error.InvalidModelChoice) {
@@ -387,10 +408,19 @@ fn setupChoice(label: []const u8, options: []const terminal.ModelOption) ![]cons
                 }
                 return err;
             };
+            if (result.back) {
+                if (escape_back) return setup_back;
+                return error.PickerCancelled;
+            }
             return result.value;
         }
     }
-    return prompt(A, try std.fmt.allocPrint(A, "{s} [1]: ", .{label}));
+    const choice = try prompt(A, try std.fmt.allocPrint(A, "{s} [1]: ", .{label}));
+    if (escape_back and std.mem.indexOfScalar(u8, choice, 27) != null) return setup_back;
+    return choice;
+}
+fn setupChoice(label: []const u8, options: []const terminal.ModelOption) ![]const u8 {
+    return setupChoiceWithBack(label, options, false);
 }
 fn storageChoice() ![]const u8 {
     const home = env("HOME") orelse return error.HomeMissing;
@@ -399,7 +429,7 @@ fn storageChoice() ![]const u8 {
     const start = home;
     while (true) {
         if (!terminal.rich()) try say("  1  ~/Documents/{s} (Recommended)\n  2  Select a folder…\n", .{app});
-        const choice = try setupChoice("Folder", &.{
+        const choice = try setupChoice("1/3 Where should your markdown live?", &.{
             .{ .value = "default", .label = try std.fmt.allocPrint(A, "~/Documents/{s} (Recommended)", .{app}), .detail = default },
             .{ .value = "select", .label = "Select a folder…", .detail = "Browse your computer" },
         });
@@ -449,7 +479,14 @@ fn configureProvider(c: *Config, id: []const u8, args: []const []const u8, inter
         const value = try prompt(A, try std.fmt.allocPrint(A, "API base URL [{s}]: ", .{next.endpoint}));
         if (value.len > 0) next.endpoint = value;
     }
-    if (interactive and (spec.transport == .ollama or (spec.auth != .none and spec.auth != .copilot))) {
+    if (interactive and std.mem.eql(u8, id, "chatgpt")) {
+        const choices = modelChoices(next) catch blk: {
+            try out("Could not list provider models. Enter a supported model name.\n");
+            break :blk &.{};
+        };
+        for (choices) |option| try terminal.line(A, "  ", option.value);
+        if (next.model.len == 0 and flag(args, "--model") == null and choices.len > 0 and chatgptModelRank(choices[0].value) <= 1) next.model = choices[0].value;
+    } else if (interactive and (spec.transport == .ollama or (spec.auth != .none and spec.auth != .copilot))) {
         models(id, next.endpoint) catch try out("Could not list provider models. Enter a supported model name.\n");
     }
     if (interactive and !std.mem.eql(u8, id, "manual")) {
@@ -470,24 +507,39 @@ fn configureProvider(c: *Config, id: []const u8, args: []const []const u8, inter
     }
     c.* = next;
 }
-fn choose(c: *Config) !void {
-    var options: std.ArrayList(terminal.ModelOption) = .empty;
-    for (providers.all) |spec| {
-        const label = if (std.mem.eql(u8, spec.id, "manual")) "Manual (Recommended) — no model needed" else spec.label;
-        try options.append(A, .{ .value = spec.id, .label = label });
-    }
-    if (!terminal.rich()) for (options.items, 0..) |option, i| try say("  {d}  {s}\n", .{ i + 1, option.label });
+fn choose(c: *Config, title: []const u8) !void {
+    var provider_list_expanded = false;
     while (true) {
-        var id = try setupChoice("AI provider", options.items);
-        if (!terminal.rich() and providers.lookup(id) == null) {
+        var options: std.ArrayList(terminal.ModelOption) = .empty;
+        if (provider_list_expanded) {
+            for (providers.all) |spec| {
+                const label = if (std.mem.eql(u8, spec.id, "manual")) "Manual — no model needed" else spec.label;
+                try options.append(A, .{ .value = spec.id, .label = label });
+            }
+        } else {
+            try options.appendSlice(A, &.{
+                .{ .value = "chatgpt", .label = "ChatGPT" },
+                .{ .value = "grok", .label = "Grok" },
+                .{ .value = "ollama", .label = "Local with Ollama" },
+                .{ .value = "more", .label = "More..." },
+            });
+        }
+        if (!terminal.rich()) for (options.items, 0..) |option, i| try say("  {d}  {s}\n", .{ i + 1, option.label });
+        const id = try setupChoice(title, options.items);
+        if (!provider_list_expanded and (std.mem.eql(u8, id, "more") or std.mem.eql(u8, id, "4"))) {
+            provider_list_expanded = true;
+            continue;
+        }
+        var provider_id = id;
+        if (!terminal.rich() and providers.lookup(provider_id) == null) {
             const index = if (id.len == 0) 1 else std.fmt.parseInt(usize, id, 10) catch 0;
             if (index == 0 or index > options.items.len) {
                 try say("Choose a number from 1 to {d}.\n", .{options.items.len});
                 continue;
             }
-            id = options.items[index - 1].value;
+            provider_id = options.items[index - 1].value;
         }
-        configureProvider(c, id, &.{}, true) catch |err| {
+        configureProvider(c, provider_id, &.{}, true) catch |err| {
             if (err == error.InputClosed or err == error.PickerCancelled) return err;
             report(err);
             continue;
@@ -518,7 +570,7 @@ fn organization(c: *Config) !void {
     try setupQuestion(2, "How would you like to organize your tasks?");
     if (!terminal.rich()) try out("  1  Simple (Recommended) — one Markdown list\n  2  Custom — a folder and optional first task\n  3  Templates — projects or areas\n");
     while (true) {
-        const choice = try setupChoice("Organization", &.{
+        const choice = try setupChoice("2/3 How would you like to organize your tasks?", &.{
             .{ .value = "1", .label = "Simple (Recommended) — one Markdown list" },
             .{ .value = "2", .label = "Custom — a folder and optional first task" },
             .{ .value = "3", .label = "Templates — projects or areas" },
@@ -541,14 +593,17 @@ fn organization(c: *Config) !void {
         if (std.mem.eql(u8, choice, "3")) {
             if (!terminal.rich()) try out("\n  1  Projects (Recommended) — Inbox, Projects, Archive\n  2  Areas — Personal, Work, Someday\n");
             while (true) {
-                const template = try setupChoice("Template", &.{
+                const template = try setupChoiceWithBack("2/3 Template for your tasks", &.{
                     .{ .value = "1", .label = "Projects (Recommended) — Inbox, Projects, Archive" },
                     .{ .value = "2", .label = "Areas — Personal, Work, Someday" },
-                });
+                    .{ .value = setup_back, .label = "Back" },
+                }, true);
+                if (std.mem.eql(u8, template, setup_back) or std.mem.eql(u8, template, "3")) break;
                 if (template.len == 0 or std.mem.eql(u8, template, "1")) return folderSetup(c, .projects, null, null);
                 if (std.mem.eql(u8, template, "2")) return folderSetup(c, .areas, null, null);
-                try out("Choose 1 or 2.\n");
+                try out("Choose 1, 2, or 3.\n");
             }
+            continue;
         }
         try out("Choose 1, 2, or 3.\n");
     }
@@ -577,7 +632,7 @@ fn init(args: []const []const u8) !void {
         try std.fs.cwd().makePath(c.storage);
         try organization(&c);
         try setupQuestion(3, "How would you like your AI?");
-        try choose(&c);
+        try choose(&c, "3/3 How would you like your AI?");
     }
     try save(c);
     try say("\nReady. Markdown: {s}/tasks.md\n", .{c.storage});
@@ -1659,13 +1714,13 @@ fn dispatch(c: Config, cmd: []const u8, args: []const []const u8) !void {
     if (std.mem.eql(u8, cmd, "model")) {
         if (!std.mem.eql(u8, c.provider, "manual") and platform.isTty(0)) return modelPicker(c);
         var next = c;
-        try choose(&next);
+        try choose(&next, "AI provider");
         try save(next);
         return;
     }
     if (std.mem.eql(u8, cmd, "provider")) {
         var next = c;
-        if (args.len == 0) try choose(&next) else try configureProvider(&next, args[0], args[1..], false);
+        if (args.len == 0) try choose(&next, "AI provider") else try configureProvider(&next, args[0], args[1..], false);
         return save(next);
     }
     if (std.mem.eql(u8, cmd, "login")) return loginProvider(if (args.len > 0) args[0] else if (std.mem.eql(u8, c.provider, "manual")) "chatgpt" else c.provider);
@@ -1912,12 +1967,12 @@ fn settings(c: Config) !void {
         try save(next);
     } else if (std.mem.eql(u8, choice, "2")) {
         var next = c;
-        try choose(&next);
+        try choose(&next, "AI provider");
         try save(next);
     } else if (std.mem.eql(u8, choice, "3")) {
         if (std.mem.eql(u8, c.provider, "manual")) {
             var next = c;
-            try choose(&next);
+            try choose(&next, "AI provider");
             try save(next);
         } else try modelPicker(c);
     } else if (std.mem.eql(u8, choice, "4")) {
@@ -2163,7 +2218,7 @@ fn runInteractive(config: Config) !void {
             if (e == error.ModelPickerRequested) {
                 if (std.mem.eql(u8, current.provider, "manual")) {
                     var next = current;
-                    choose(&next) catch |err| {
+                    choose(&next, "AI provider") catch |err| {
                         report(err);
                         continue;
                     };

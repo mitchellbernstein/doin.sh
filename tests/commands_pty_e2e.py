@@ -50,7 +50,11 @@ def main():
                     assert time.monotonic()<deadline,(marker,transcript.decode(errors='replace'))
                     if select.select([master],[],[],.1)[0]:transcript.extend(os.read(master,65536))
             def send(text,marker):
-                transcript.clear();os.write(master,(text+'\n').encode());wait(marker);receipts.append({'command':text,'terminal':transcript.decode(errors='replace')})
+                transcript.clear();os.write(master,(text+'\n').encode())
+                if text.startswith('/'):
+                    submitted_echo='User  '+text;wait(submitted_echo);response_start=transcript.index(submitted_echo.encode())+len(submitted_echo.encode());wait(marker,start=response_start)
+                else:wait(marker)
+                receipts.append({'command':text,'terminal':transcript.decode(errors='replace')})
             wait('doin')
             send('/folder create '+rootid+' Release café','Folder created')
             child=storage/'Release café';assert child.is_dir();childid=json.loads((child/'.doin-folder.json').read_text())['id']
