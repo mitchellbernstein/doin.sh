@@ -20,6 +20,7 @@ jobs:
           python3 tests/focus_ai_e2e.py
           python3 tests/providers_e2e.py
           python3 tests/uninstall_e2e.py
+          python3 tests/uninstall_pty_e2e.py
           python3 tests/update_e2e.py
           python3 tests/package_version_e2e.py
           python3 tests/auth_e2e.py
