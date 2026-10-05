@@ -183,7 +183,7 @@ pub fn run(a: A, args: []const []const u8) !void {
     try std.fs.cwd().makeDir(stage);
     defer std.fs.cwd().deleteTree(stage) catch {};
     if (builtin.os.tag != .windows) {
-        var directory = try std.fs.cwd().openDir(stage, .{});
+        var directory = try std.fs.cwd().openDir(stage, .{ .iterate = true });
         defer directory.close();
         try std.posix.fchmod(directory.fd, 0o700);
     }
